@@ -39,6 +39,8 @@ use crate::{
     },
 };
 
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub async fn run(cli: Cli) -> Result<()> {
     init_logging(cli.verbose);
     if cli.readme {
@@ -251,6 +253,14 @@ async fn run_server(cli: &Cli) -> Result<()> {
     };
     let config = server_config(&material.identity, &material.relay, credentials, &access)?;
     let mesh = MeshInstance::start(config).await?;
+    mesh.wait_for_peer_connection(RELAY_CONNECT_TIMEOUT)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to relay {}, {}",
+                material.relay.id, material.relay.region
+            )
+        })?;
     let encoded = token.encode()?;
     report_server_address(
         cli,

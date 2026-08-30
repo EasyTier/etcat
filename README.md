@@ -190,10 +190,11 @@ public_key = "base64-encoded-32-byte-EasyTier-public-key"
 ```
 
 Relay candidates are probed concurrently with three TCP samples and the lowest
-median RTT wins. If every probe fails, `priority` is used. When `public_key` is
-present, EasyTier must authenticate that exact relay key. When it is absent,
-the relay is encrypted but unpinned and etcat prints a warning. The bundled
-`official-global` entry is currently unpinned.
+median RTT wins. Startup fails if every candidate is unreachable. After EasyTier
+starts, etcat waits for a real peer connection before printing the server token.
+When `public_key` is present, EasyTier must authenticate that exact relay key.
+When it is absent, the relay is encrypted but unpinned and etcat prints a
+warning. The bundled `official-global` entry is currently unpinned.
 
 ## Security model
 

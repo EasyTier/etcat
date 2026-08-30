@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -41,6 +42,25 @@ impl MeshInstance {
 
     pub fn core(&self) -> &Arc<NativeCoreInstance> {
         &self.core
+    }
+
+    pub async fn wait_for_peer_connection(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self
+                    .core
+                    .peer_snapshots()
+                    .await
+                    .iter()
+                    .any(|peer| !peer.conns.is_empty())
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("no EasyTier peer connected within {timeout:?}"))
     }
 
     pub async fn stop(&self) {

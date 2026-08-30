@@ -9,4 +9,3 @@ endpoints = [
   "tcp://public.easytier.top:11010",
   "udp://public.easytier.top:11010",
 ]
-

@@ -88,6 +88,7 @@ impl RelayRegistry {
             probes.spawn(async move {
                 let relay = &relays[index];
                 let mut samples = Vec::with_capacity(3);
+                let mut last_error = None;
                 for _ in 0..3 {
                     let started = tokio::time::Instant::now();
                     let result = tokio::time::timeout(
@@ -95,35 +96,47 @@ impl RelayRegistry {
                         tokio::net::TcpStream::connect(&relay.probe),
                     )
                     .await;
-                    if matches!(result, Ok(Ok(_))) {
-                        samples.push(started.elapsed());
+                    match result {
+                        Ok(Ok(_)) => samples.push(started.elapsed()),
+                        Ok(Err(error)) => last_error = Some(error.to_string()),
+                        Err(_) => last_error = Some("timed out after 1.5s".to_owned()),
                     }
                 }
                 samples.sort_unstable();
-                samples
-                    .get(samples.len() / 2)
-                    .copied()
-                    .map(|rtt| (index, rtt))
+                (index, samples.get(samples.len() / 2).copied(), last_error)
             });
         }
 
         let mut best = None;
+        let mut failures = vec![None; self.relays.len()];
         while let Some(result) = probes.join_next().await {
-            if let Some(candidate) = result.context("relay probe task failed")?
-                && best.is_none_or(|(_, best_rtt)| candidate.1 < best_rtt)
-            {
-                best = Some(candidate);
+            let (index, rtt, error) = result.context("relay probe task failed")?;
+            if let Some(rtt) = rtt {
+                if best.is_none_or(|(_, best_rtt)| rtt < best_rtt) {
+                    best = Some((index, rtt));
+                }
+            } else {
+                failures[index] = error;
             }
         }
         if let Some((index, _)) = best {
             return Ok(self.relays[index].clone());
         }
 
-        self.relays
+        let failures = self
+            .relays
             .iter()
-            .min_by_key(|relay| relay.priority)
-            .cloned()
-            .context("relay registry is empty")
+            .zip(failures)
+            .map(|(relay, error)| {
+                format!(
+                    "{}: {}",
+                    relay.id,
+                    error.unwrap_or_else(|| "probe failed".to_owned())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("no reachable relay after three TCP probes each ({failures})")
     }
 }
 
@@ -131,9 +144,50 @@ impl RelayRegistry {
 mod tests {
     use super::*;
 
+    fn relay(id: &str, probe: String) -> Relay {
+        Relay {
+            id: id.to_owned(),
+            region: "test".to_owned(),
+            endpoints: vec![format!("tcp://{probe}").parse().unwrap()],
+            probe,
+            public_key: None,
+            priority: 0,
+        }
+    }
+
     #[test]
     fn built_in_registry_is_valid() {
         let registry = RelayRegistry::load(None).unwrap();
         assert!(!registry.relays().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_rejects_unreachable_relays() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let probe = listener.local_addr().unwrap();
+        drop(listener);
+        let registry = RelayRegistry {
+            relays: vec![relay("unreachable", probe.to_string())],
+        };
+
+        let error = registry.select(None).await.unwrap_err().to_string();
+
+        assert!(error.contains("no reachable relay"));
+        assert!(error.contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_returns_a_reachable_relay() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let expected = relay("reachable", listener.local_addr().unwrap().to_string());
+        let registry = RelayRegistry {
+            relays: vec![expected.clone()],
+        };
+
+        assert_eq!(registry.select(None).await.unwrap(), expected);
     }
 }
