@@ -12,6 +12,7 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 ciborium = "0.2"
+data-encoding = "2.11"
 directories = "6.0"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 easytier = { git = "https://github.com/EasyTier/EasyTier.git", rev = "164e2db6aecd13117d840821d5b889b51cb7c463", default-features = false, features = [
@@ -35,6 +36,7 @@ easytier-core = { git = "https://github.com/EasyTier/EasyTier.git", rev = "164e2
 hex = "0.4"
 hostname = "0.4"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
+hmac = "0.12"
 hickory-resolver = "0.25"
 humantime = "2.2"
 rand = "0.8"

@@ -10,13 +10,17 @@ pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
 
-    /// Use a new in-memory identity or a saved server/client key name.
+    /// Use `new`, a saved key name, or a private JSON key path.
     #[arg(long, global = true)]
     pub(crate) key: Option<String>,
 
     /// Override the built-in relay registry.
     #[arg(long, global = true, env = "ETCAT_RELAY_FILE")]
     pub(crate) relay_file: Option<PathBuf>,
+
+    /// Print the etcat README and exit.
+    #[arg(long, global = true)]
+    pub(crate) readme: bool,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -31,12 +35,12 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub(crate) serve: Vec<String>,
 
-    /// Client public keys allowed to decrypt a connection token.
+    /// Client public keys allowed to connect, or `none` to deny every client.
     #[arg(long, value_delimiter = ',')]
     pub(crate) allow: Vec<String>,
 
     /// Print a self-contained token with embedded relay metadata.
-    #[arg(long)]
+    #[arg(long, visible_alias = "embed-relay-map")]
     pub(crate) full_address: bool,
 
     /// Print machine-readable server startup output.
@@ -116,22 +120,47 @@ pub(crate) struct GenkeyArgs {
     /// Delete the selected saved key.
     #[arg(long)]
     pub(crate) delete: bool,
-    /// Saved key name; defaults to `default` or `client-default`.
+    /// Saved key name or private JSON path; defaults by key type.
     #[arg(long)]
     pub(crate) key: Option<String>,
     /// Select a relay by registry ID instead of measuring latency.
-    #[arg(long)]
+    #[arg(long, visible_alias = "region")]
     pub(crate) relay: Option<String>,
     /// Reuse the selected relay across future server restarts.
-    #[arg(long)]
+    #[arg(long, visible_alias = "fixed-region")]
     pub(crate) fixed_relay: bool,
     /// Embed relay metadata in the printed token.
-    #[arg(long)]
+    #[arg(
+        long,
+        visible_aliases = ["embed-relay-map", "embed-derp-map"]
+    )]
     pub(crate) full_address: bool,
 }
 
 impl Cli {
     pub async fn run(self) -> Result<()> {
         crate::app::run(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tailcat_genkey_aliases_map_to_relay_options() {
+        let cli =
+            Cli::try_parse_from(["etcat", "genkey", "--region=auto", "--embed-derp-map"]).unwrap();
+        let Some(Command::Genkey(args)) = cli.command else {
+            panic!("expected genkey command")
+        };
+        assert_eq!(args.relay.as_deref(), Some("auto"));
+        assert!(args.full_address);
+
+        let cli = Cli::try_parse_from(["etcat", "genkey", "--fixed-region"]).unwrap();
+        let Some(Command::Genkey(args)) = cli.command else {
+            panic!("expected genkey command")
+        };
+        assert!(args.fixed_relay);
     }
 }

@@ -5,6 +5,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -17,6 +18,7 @@ use crate::{
 
 pub const TOKEN_PREFIX: &str = "etc1";
 const MAX_ENCODED_TOKEN_LEN: usize = 16 * 1024;
+const TOKEN_LABEL_LEN: usize = 63;
 const CLIENT_PUBLIC_KEY_PREFIX: &str = "etcp1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,13 +98,7 @@ struct WireRelay(
 impl ConnectionToken {
     pub fn credential_aad(&self) -> Result<Vec<u8>> {
         #[derive(Serialize)]
-        struct CredentialAad(
-            u8,
-            #[serde(with = "serde_bytes")] Vec<u8>,
-            u16,
-            WireRelay,
-            Option<i64>,
-        );
+        struct CredentialAad(u8, #[serde(with = "serde_bytes")] Vec<u8>, u16, Option<i64>);
 
         let mut bytes = Vec::new();
         ciborium::into_writer(
@@ -110,7 +106,6 @@ impl ConnectionToken {
                 self.version,
                 self.server_public_key()?.to_vec(),
                 self.server.gateway_port,
-                relay_to_wire(&self.relay)?,
                 self.expires_unix,
             ),
             &mut bytes,
@@ -123,7 +118,16 @@ impl ConnectionToken {
         let wire = self.to_wire()?;
         let mut bytes = Vec::new();
         ciborium::into_writer(&wire, &mut bytes).context("failed to encode connection token")?;
-        let encoded = format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes));
+        let compact = format!(
+            "{TOKEN_PREFIX}{}",
+            BASE32_NOPAD.encode(&bytes).to_ascii_lowercase()
+        );
+        let encoded = compact
+            .as_bytes()
+            .chunks(TOKEN_LABEL_LEN)
+            .map(|label| std::str::from_utf8(label).expect("token encoding is ASCII"))
+            .collect::<Vec<_>>()
+            .join(".");
         if encoded.len() > MAX_ENCODED_TOKEN_LEN {
             anyhow::bail!("connection token exceeds {MAX_ENCODED_TOKEN_LEN} bytes");
         }
@@ -134,12 +138,25 @@ impl ConnectionToken {
         if input.len() > MAX_ENCODED_TOKEN_LEN {
             anyhow::bail!("connection token exceeds {MAX_ENCODED_TOKEN_LEN} bytes");
         }
-        let payload = input
+        anyhow::ensure!(
+            input
+                .split('.')
+                .all(|label| !label.is_empty() && label.len() <= TOKEN_LABEL_LEN),
+            "connection token contains an invalid hostname label"
+        );
+        let compact = input.replace('.', "");
+        anyhow::ensure!(
+            compact
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            "connection token must use lowercase hostname characters"
+        );
+        let payload = compact
             .strip_prefix(TOKEN_PREFIX)
             .context("connection token must start with 'etc1'")?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(payload)
-            .context("connection token is not valid base64url")?;
+        let bytes = BASE32_NOPAD
+            .decode(payload.to_ascii_uppercase().as_bytes())
+            .context("connection token is not valid base32")?;
         let wire: WireToken = ciborium::from_reader(Cursor::new(bytes))
             .context("connection token contains invalid CBOR")?;
         let token = Self::from_wire(wire)?;
@@ -454,10 +471,14 @@ mod tests {
         let token = sample();
         let encoded = token.encode().unwrap();
         assert!(
-            encoded.len() <= 140,
+            encoded.len() <= 170,
             "token is {} characters",
             encoded.len()
         );
+        assert_eq!(encoded, encoded.to_ascii_lowercase());
+        assert!(encoded.split('.').all(|label| label.len() <= 63));
+        let url = url::Url::parse(&format!("http://{encoded}:8080/")).unwrap();
+        assert_eq!(url.host_str().unwrap(), encoded);
         assert_eq!(ConnectionToken::decode(&encoded).unwrap(), token);
     }
 
@@ -483,8 +504,11 @@ mod tests {
     #[test]
     fn resolves_registry_reference() {
         let registry = RelayRegistry::load(None).unwrap();
-        let token = sample().resolve(&registry).unwrap();
+        let original = sample();
+        let original_aad = original.credential_aad().unwrap();
+        let token = original.resolve(&registry).unwrap();
         assert!(matches!(token.relay, RelayLocator::Inline { .. }));
         assert!(token.encode().unwrap().len() > sample().encode().unwrap().len());
+        assert_eq!(token.credential_aad().unwrap(), original_aad);
     }
 }

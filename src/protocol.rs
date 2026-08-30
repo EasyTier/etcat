@@ -1,8 +1,13 @@
-use std::{future::Future, io};
+use std::{
+    future::Future,
+    io,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +16,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_FRAME_LEN: usize = 4096;
 const SIGNATURE_DOMAIN: &[u8] = b"etcat-gateway-v1\0";
+const CLIENT_AUTH_DOMAIN: &[u8] = b"etcat-client-auth-v1\0";
+const REQUEST_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
 pub enum GatewayHandshakeError {
@@ -35,6 +47,8 @@ pub struct GatewayRequest {
     pub version: u8,
     pub nonce: [u8; 32],
     pub destination: Destination,
+    #[serde(with = "serde_bytes")]
+    authenticator: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,14 +60,21 @@ struct GatewayResponse {
 }
 
 impl GatewayRequest {
-    pub fn new(destination: Destination) -> Self {
+    pub fn new(
+        network_name: &str,
+        destination: Destination,
+        authentication_key: &[u8; 32],
+    ) -> Result<Self> {
         let mut nonce = [0_u8; 32];
         OsRng.fill_bytes(&mut nonce);
-        Self {
+        let mut request = Self {
             version: 1,
             nonce,
             destination,
-        }
+            authenticator: Vec::new(),
+        };
+        request.authenticator = authenticate_request(network_name, &request, authentication_key)?;
+        Ok(request)
     }
 }
 
@@ -62,11 +83,12 @@ pub async fn client_handshake<S>(
     network_name: &str,
     destination: Destination,
     server_key: &VerifyingKey,
+    authentication_key: &[u8; 32],
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = GatewayRequest::new(destination);
+    let request = GatewayRequest::new(network_name, destination, authentication_key)?;
     let request_bytes = encode(&request)?;
     write_frame(stream, &request_bytes).await?;
     let response: GatewayResponse = decode(&read_frame(stream).await?)?;
@@ -95,6 +117,8 @@ pub async fn server_handshake<S, F, Fut, T>(
     stream: &mut S,
     network_name: &str,
     signing_key: &SigningKey,
+    authentication_keys: &[[u8; 32]],
+    authentication_expiry: Option<i64>,
     connect: F,
 ) -> Result<(Destination, T)>
 where
@@ -102,12 +126,33 @@ where
     F: FnOnce(Destination) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let request_bytes = read_frame(stream).await?;
+    let request_bytes = tokio::time::timeout(REQUEST_TIMEOUT, read_frame(stream))
+        .await
+        .context("gateway request timed out")??;
     let request: GatewayRequest = decode(&request_bytes)?;
     if request.version != 1 {
         anyhow::bail!("unsupported gateway protocol version {}", request.version);
     }
-    let result = connect(request.destination.clone()).await;
+    let expired = authentication_expiry.is_some_and(|expiry| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .is_ok_and(|now| i64::try_from(now.as_secs()).is_ok_and(|now| now >= expiry))
+    });
+    let authentication_bytes = request_authentication_bytes(network_name, &request)?;
+    let authenticated = authentication_keys.iter().fold(false, |valid, key| {
+        let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+            return valid;
+        };
+        mac.update(&authentication_bytes);
+        valid | mac.verify_slice(&request.authenticator).is_ok()
+    });
+    let result = if expired {
+        Err(anyhow::anyhow!("client credential has expired"))
+    } else if authenticated {
+        connect(request.destination.clone()).await
+    } else {
+        Err(anyhow::anyhow!("client authentication failed"))
+    };
     let (accepted, message) = match &result {
         Ok(_) => (true, String::new()),
         Err(error) => (false, format!("{error:#}")),
@@ -123,6 +168,41 @@ where
         Ok(connected) => Ok((request.destination, connected)),
         Err(_) => Err(GatewayHandshakeError::Rejected(message).into()),
     }
+}
+
+fn authenticate_request(
+    network_name: &str,
+    request: &GatewayRequest,
+    authentication_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let bytes = request_authentication_bytes(network_name, request)?;
+    let mut mac = HmacSha256::new_from_slice(authentication_key)?;
+    mac.update(&bytes);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn request_authentication_bytes(network_name: &str, request: &GatewayRequest) -> Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct ClientAuth<'a> {
+        domain: &'a [u8],
+        network_name: &'a str,
+        version: u8,
+        nonce: &'a [u8; 32],
+        destination: &'a Destination,
+    }
+
+    let mut bytes = Vec::new();
+    ciborium::into_writer(
+        &ClientAuth {
+            domain: CLIENT_AUTH_DOMAIN,
+            network_name,
+            version: request.version,
+            nonce: &request.nonce,
+            destination: &request.destination,
+        },
+        &mut bytes,
+    )?;
+    Ok(bytes)
 }
 
 fn transcript(network_name: &str, request: &[u8], accepted: bool, message: &str) -> Vec<u8> {
@@ -177,15 +257,23 @@ mod tests {
     async fn signed_handshake_authenticates_and_authorizes() {
         let signing = SigningKey::generate(&mut OsRng);
         let verifying = signing.verifying_key();
+        let authentication_key = [7_u8; 32];
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_handshake(&mut server, "network", &signing, |destination| async move {
-                anyhow::ensure!(
-                    destination == Destination::ServerPort { port: 80 },
-                    "not allowed"
-                );
-                Ok(())
-            })
+            server_handshake(
+                &mut server,
+                "network",
+                &signing,
+                &[authentication_key],
+                None,
+                |destination| async move {
+                    anyhow::ensure!(
+                        destination == Destination::ServerPort { port: 80 },
+                        "not allowed"
+                    );
+                    Ok(())
+                },
+            )
             .await
         });
         client_handshake(
@@ -193,6 +281,7 @@ mod tests {
             "network",
             Destination::ServerPort { port: 80 },
             &verifying,
+            &authentication_key,
         )
         .await
         .unwrap();
@@ -206,11 +295,17 @@ mod tests {
     async fn rejected_handshake_is_still_authenticated() {
         let signing = SigningKey::generate(&mut OsRng);
         let verifying = signing.verifying_key();
+        let authentication_key = [7_u8; 32];
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_handshake(&mut server, "network", &signing, |_| async {
-                Err::<(), _>(anyhow::anyhow!("blocked"))
-            })
+            server_handshake(
+                &mut server,
+                "network",
+                &signing,
+                &[authentication_key],
+                None,
+                |_| async { Err::<(), _>(anyhow::anyhow!("blocked")) },
+            )
             .await
         });
         let error = client_handshake(
@@ -218,6 +313,7 @@ mod tests {
             "network",
             Destination::ServerPort { port: 22 },
             &verifying,
+            &authentication_key,
         )
         .await
         .unwrap_err();
@@ -234,12 +330,18 @@ mod tests {
     async fn success_waits_until_the_destination_is_connected() {
         let signing = SigningKey::generate(&mut OsRng);
         let verifying = signing.verifying_key();
+        let authentication_key = [7_u8; 32];
         let (mut client, mut server) = tokio::io::duplex(8192);
         let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
-            server_handshake(&mut server, "network", &signing, |_| async {
-                connected_rx.await.context("destination signal was dropped")
-            })
+            server_handshake(
+                &mut server,
+                "network",
+                &signing,
+                &[authentication_key],
+                None,
+                |_| async { connected_rx.await.context("destination signal was dropped") },
+            )
             .await
         });
         let client_task = tokio::spawn(async move {
@@ -248,6 +350,7 @@ mod tests {
                 "network",
                 Destination::ServerPort { port: 80 },
                 &verifying,
+                &authentication_key,
             )
             .await
         });
@@ -257,5 +360,96 @@ mod tests {
         connected_tx.send(()).unwrap();
         client_task.await.unwrap().unwrap();
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_clients_without_the_credential_secret() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let verifying = signing.verifying_key();
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            server_handshake(
+                &mut server,
+                "network",
+                &signing,
+                &[[7_u8; 32]],
+                None,
+                |_| async { Ok(()) },
+            )
+            .await
+        });
+
+        let error = client_handshake(
+            &mut client,
+            "network",
+            Destination::NoAuthSsh,
+            &verifying,
+            &[8_u8; 32],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("client authentication failed"));
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_gateway_requests_time_out() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let (_client, mut server) = tokio::io::duplex(8192);
+
+        let error = server_handshake(
+            &mut server,
+            "network",
+            &signing,
+            &[[7_u8; 32]],
+            None,
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("gateway request timed out"));
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_cannot_use_the_local_gateway() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let verifying = signing.verifying_key();
+        let authentication_key = [7_u8; 32];
+        let connected = Arc::new(AtomicBool::new(false));
+        let server_connected = connected.clone();
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            server_handshake(
+                &mut server,
+                "network",
+                &signing,
+                &[authentication_key],
+                Some(0),
+                |_| async move {
+                    server_connected.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        let error = client_handshake(
+            &mut client,
+            "network",
+            Destination::NoAuthSsh,
+            &verifying,
+            &authentication_key,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("credential has expired"));
+        assert!(server_task.await.unwrap().is_err());
+        assert!(!connected.load(Ordering::Relaxed));
     }
 }

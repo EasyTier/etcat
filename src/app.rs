@@ -14,6 +14,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional},
     net::{TcpListener, TcpStream},
     process::Command as ProcessCommand,
+    sync::Semaphore,
 };
 
 use crate::{
@@ -22,7 +23,9 @@ use crate::{
         client_public_key, generate_client_key, open_credential, seal_credential,
         validate_public_key,
     },
-    identity::{ServerIdentity as PrivateServerIdentity, generate_credential_secret},
+    identity::{
+        ServerIdentity as PrivateServerIdentity, decode_private_key, generate_credential_secret,
+    },
     key::{SavedKey, SavedServerKey},
     network::{
         AccessPolicy, CLIENT_GROUP, MeshInstance, client_config, managed_credential, server_config,
@@ -38,6 +41,15 @@ use crate::{
 
 pub async fn run(cli: Cli) -> Result<()> {
     init_logging(cli.verbose);
+    if cli.readme {
+        print!("{}", include_str!("../README.md"));
+        return Ok(());
+    }
+    anyhow::ensure!(
+        cli.serve.is_empty()
+            || (cli.command.is_none() && cli.target.is_none() && cli.destination.is_none()),
+        "no positional arguments are valid along with --serve"
+    );
     match cli.command.as_ref() {
         Some(Command::Parse(args)) => parse_token(&args.token),
         Some(Command::Resolve(args)) => {
@@ -140,8 +152,13 @@ async fn genkey(args: &GenkeyArgs, relay_file: Option<&Path>) -> Result<()> {
         return Ok(());
     }
     if args.client {
+        anyhow::ensure!(
+            args.relay.is_none() && !args.fixed_relay && !args.full_address,
+            "genkey --client does not take relay selection flags"
+        );
         let name = args.key.as_deref().unwrap_or("client-default");
         if args.delete {
+            anyhow::ensure!(args.key.is_some(), "genkey --delete requires --key=<name>");
             crate::key::delete(name)?;
             return Ok(());
         }
@@ -149,18 +166,27 @@ async fn genkey(args: &GenkeyArgs, relay_file: Option<&Path>) -> Result<()> {
             private_key: generate_client_key(),
         };
         let path = crate::key::save(name, &SavedKey::Client(saved.clone()), args.force)?;
-        eprintln!("# wrote client key to {}", path.display());
+        eprintln!("# wrote file to {}", path.display());
         println!("{}", client_public_key(&saved.private_key)?);
         return Ok(());
     }
     let name = args.key.as_deref().unwrap_or("default");
     if args.delete {
+        anyhow::ensure!(args.key.is_some(), "genkey --delete requires --key=<name>");
         crate::key::delete(name)?;
         return Ok(());
     }
 
     let registry = RelayRegistry::load(relay_file)?;
-    let relay = registry.select(args.relay.as_deref()).await?;
+    if args.relay.as_deref() == Some("list") {
+        return list_relays(relay_file);
+    }
+    anyhow::ensure!(
+        !(args.fixed_relay && args.relay.is_some()),
+        "genkey --fixed-region and --region are mutually exclusive"
+    );
+    let requested_relay = args.relay.as_deref().filter(|relay| *relay != "auto");
+    let relay = registry.select(requested_relay).await?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let gateway_port = listener.local_addr()?.port();
     drop(listener);
@@ -168,11 +194,11 @@ async fn genkey(args: &GenkeyArgs, relay_file: Option<&Path>) -> Result<()> {
         identity: PrivateServerIdentity::generate(),
         credential_secret: generate_credential_secret(),
         relay_id: relay.id.clone(),
-        fixed_relay: args.fixed_relay || args.relay.is_some(),
+        fixed_relay: args.fixed_relay || requested_relay.is_some(),
         gateway_port,
     };
     let path = crate::key::save(name, &SavedKey::Server(saved.clone()), args.force)?;
-    eprintln!("# wrote key to {}", path.display());
+    eprintln!("# wrote file to {}", path.display());
     let token = make_token(
         &saved.identity,
         CredentialEnvelope::Bearer {
@@ -217,7 +243,7 @@ async fn run_server(cli: &Cli) -> Result<()> {
     };
     let gateway_port = gateway.local_addr()?.port();
     let expires_unix = expiry_from_ttl(cli.ttl.as_deref())?;
-    let (credentials, token) =
+    let (credentials, token, authentication_keys) =
         prepare_credentials_and_token(cli, &material, gateway_port, expires_unix)?;
     let access = AccessPolicy {
         destination_ip: material.identity.gateway_ipv4(),
@@ -235,28 +261,45 @@ async fn run_server(cli: &Cli) -> Result<()> {
     .await?;
 
     let signing_key = Arc::new(material.identity.signing_key()?);
+    let authentication_keys = Arc::new(authentication_keys);
     let policy = Arc::new(policy);
+    let gateway_slots = Arc::new(Semaphore::new(256));
     let stream_mode = cli.serve.is_empty();
     loop {
         tokio::select! {
             accepted = gateway.accept() => {
                 let (stream, _) = accepted?;
                 if stream_mode {
-                    handle_stream_connection(
+                    match handle_stream_connection(
                         stream,
                         &material.identity.network_name,
                         signing_key.as_ref(),
-                    ).await?;
-                    break;
+                        &authentication_keys,
+                        expires_unix,
+                    ).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::debug!(?error, "gateway connection closed");
+                            continue;
+                        }
+                    }
                 }
                 let network_name = material.identity.network_name.clone();
+                let Ok(slot) = gateway_slots.clone().try_acquire_owned() else {
+                    tracing::warn!("gateway connection limit reached");
+                    continue;
+                };
                 let signing_key = signing_key.clone();
                 let policy = policy.clone();
+                let authentication_keys = authentication_keys.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     if let Err(error) = handle_service_connection(
                         stream,
                         &network_name,
                         signing_key.as_ref(),
+                        &authentication_keys,
+                        expires_unix,
                         &policy,
                     ).await {
                         tracing::debug!(?error, "gateway connection closed");
@@ -357,15 +400,25 @@ fn prepare_credentials_and_token(
     material: &ServerMaterial,
     gateway_port: u16,
     expires_unix: Option<i64>,
-) -> Result<(Vec<ManagedCredentialConfig>, ConnectionToken)> {
+) -> Result<(Vec<ManagedCredentialConfig>, ConnectionToken, Vec<[u8; 32]>)> {
     let expiry = expires_unix.unwrap_or(i64::MAX);
-    if cli.allow.is_empty() {
-        let credentials = vec![managed_credential(
-            "etcat-default".to_owned(),
-            material.credential_secret.clone(),
-            vec![CLIENT_GROUP.to_owned()],
-            expiry,
-        )];
+    let deny_all = cli.allow.as_slice() == ["none"];
+    anyhow::ensure!(
+        !cli.allow.iter().any(|value| value == "none") || deny_all,
+        "--allow=none cannot be combined with client public keys"
+    );
+    if cli.allow.is_empty() || deny_all {
+        let credentials = (!deny_all)
+            .then(|| {
+                managed_credential(
+                    "etcat-default".to_owned(),
+                    material.credential_secret.clone(),
+                    vec![CLIENT_GROUP.to_owned()],
+                    expiry,
+                )
+            })
+            .into_iter()
+            .collect();
         let token = make_token(
             &material.identity,
             CredentialEnvelope::Bearer {
@@ -376,7 +429,12 @@ fn prepare_credentials_and_token(
             cli.full_address,
             expires_unix,
         )?;
-        return Ok((credentials, token));
+        let authentication_keys = if deny_all {
+            Vec::new()
+        } else {
+            vec![credential_authentication_key(&material.credential_secret)?]
+        };
+        return Ok((credentials, token, authentication_keys));
     }
 
     let mut credentials = Vec::with_capacity(cli.allow.len());
@@ -413,6 +471,10 @@ fn prepare_credentials_and_token(
         expires_unix,
     )?;
     let aad = token.credential_aad()?;
+    let authentication_keys = pending
+        .iter()
+        .map(|(_, secret, _)| credential_authentication_key(secret))
+        .collect::<Result<Vec<_>>>()?;
     let recipients = pending
         .into_iter()
         .map(|(recipient, secret, client_ipv4)| {
@@ -420,7 +482,11 @@ fn prepare_credentials_and_token(
         })
         .collect::<Result<Vec<_>>>()?;
     token.credential = CredentialEnvelope::Sealed { recipients };
-    Ok((credentials, token))
+    Ok((credentials, token, authentication_keys))
+}
+
+fn credential_authentication_key(secret: &str) -> Result<[u8; 32]> {
+    Ok(decode_private_key(secret)?.to_bytes())
 }
 
 async fn report_server_address(
@@ -429,19 +495,22 @@ async fn report_server_address(
     relay: &Relay,
     saved_key_name: Option<&str>,
 ) -> Result<()> {
-    eprintln!("# Selected shared relay {}, {}", relay.id, relay.region);
+    eprintln!("# Selected bootstrap relay {}, {}", relay.id, relay.region);
     if relay.public_key.is_none() {
         eprintln!("# WARNING: relay traffic is encrypted, but this relay has no pinned identity");
     }
     if let Some(name) = saved_key_name {
-        eprintln!("# Server listening with saved key {name:?}: {token}");
+        eprintln!("# 🐈 Server listening with saved key {name:?}: {token}");
     } else {
-        eprintln!("# Server listening with new address: {token}");
+        eprintln!("# 🐈 Server listening with new address: {token}");
     }
     if cli.json {
         println!("{}", serde_json::json!({ "listenAddr": token }));
     }
-    if let Ok(destination) = std::env::var("ETCAT_ADDR_FILE") {
+    if let Some(destination) = std::env::var("ETCAT_ADDR_FILE")
+        .ok()
+        .or_else(|| std::env::var("TAILCAT_ADDR_FILE").ok())
+    {
         if let Some(address) = destination.strip_prefix("tcp:") {
             let mut stream = TcpStream::connect(address).await?;
             stream.write_all(token.as_bytes()).await?;
@@ -480,11 +549,15 @@ async fn handle_stream_connection(
     mut stream: TcpStream,
     network_name: &str,
     signing_key: &ed25519_dalek::SigningKey,
+    authentication_keys: &[[u8; 32]],
+    authentication_expiry: Option<i64>,
 ) -> Result<()> {
     let (destination, ()) = server_handshake(
         &mut stream,
         network_name,
         signing_key,
+        authentication_keys,
+        authentication_expiry,
         |destination| async move {
             anyhow::ensure!(
                 destination == Destination::Stream,
@@ -503,6 +576,8 @@ async fn handle_service_connection(
     mut stream: TcpStream,
     network_name: &str,
     signing_key: &ed25519_dalek::SigningKey,
+    authentication_keys: &[[u8; 32]],
+    authentication_expiry: Option<i64>,
     policy: &ServePolicy,
 ) -> Result<()> {
     enum ConnectedDestination {
@@ -514,6 +589,8 @@ async fn handle_service_connection(
         &mut stream,
         network_name,
         signing_key,
+        authentication_keys,
+        authentication_expiry,
         |destination| async move {
             match &destination {
                 Destination::ServerPort { port } => {
@@ -586,6 +663,7 @@ struct ClientSession {
     gateway: SocketAddr,
     network_name: String,
     verifying_key: VerifyingKey,
+    authentication_key: [u8; 32],
 }
 
 impl ClientSession {
@@ -597,6 +675,7 @@ impl ClientSession {
         let registry = RelayRegistry::load(relay_file)?;
         let relay = resolve_relay(&token, &registry)?;
         let (credential_secret, client_ipv4) = client_credential(&token, key_name)?;
+        let authentication_key = credential_authentication_key(&credential_secret)?;
         let gateway_port = token.server.gateway_port;
         let server_ip = token.gateway_ipv4()?;
         let network_name = token.network_name()?;
@@ -626,6 +705,7 @@ impl ClientSession {
             gateway: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port),
             network_name,
             verifying_key,
+            authentication_key,
         })
     }
 
@@ -641,6 +721,7 @@ impl ClientSession {
                     &self.network_name,
                     destination.clone(),
                     &self.verifying_key,
+                    &self.authentication_key,
                 ),
             )
             .await;
@@ -729,12 +810,17 @@ async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
     } else {
         None
     };
-    let listener = TcpListener::bind(normalize_listen_address(&args.listen)?).await?;
+    let listen_address = normalize_listen_address(&args.listen)?;
+    let listener = TcpListener::bind(&listen_address)
+        .await
+        .with_context(|| format!("failed to listen on {listen_address:?}"))?;
     let address = listener.local_addr()?;
     let proxy_url = format!("socks5h://{address}");
 
     if let Some((program_name, program_args)) = program.split_first() {
-        eprintln!("# SOCKS5 proxy listening at {proxy_url}");
+        if cli.verbose > 0 {
+            eprintln!("SOCKS running at {proxy_url}");
+        }
         let server = tokio::spawn(serve_socks(listener, fixed, options));
         let status = ProcessCommand::new(program_name)
             .args(program_args)
@@ -750,7 +836,7 @@ async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    println!("SOCKS5 proxy listening at {proxy_url}");
+    eprintln!("SOCKS running at {proxy_url}");
     serve_socks(listener, fixed, options).await
 }
 
@@ -827,16 +913,25 @@ fn quote_proxy_argument(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
-fn normalize_listen_address(value: &str) -> Result<SocketAddr> {
+fn normalize_listen_address(value: &str) -> Result<String> {
     if let Ok(port) = value.parse::<u16>() {
-        return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        return Ok(format!("127.0.0.1:{port}"));
     }
     if let Ok(ip) = value.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, 0));
+        return Ok(SocketAddr::new(ip, 0).to_string());
     }
-    value
-        .parse()
-        .with_context(|| format!("invalid SOCKS listen address {value:?}"))
+    if let Some(port) = value.strip_prefix(':') {
+        port.parse::<u16>()
+            .with_context(|| format!("invalid SOCKS listen address {value:?}"))?;
+        return Ok(format!("0.0.0.0:{port}"));
+    }
+    if value.is_empty() {
+        return Ok("0.0.0.0:0".to_owned());
+    }
+    if value.rsplit_once(':').is_some() {
+        return Ok(value.to_owned());
+    }
+    Ok(format!("{value}:0"))
 }
 
 async fn serve_socks(
@@ -900,16 +995,17 @@ async fn handle_socks_connection(
     let port = stream.read_u16().await?;
 
     let dynamic;
-    let (session, destination) = if host == "server.etcat" || host.is_empty() {
+    let (session, destination) = if matches!(host.as_str(), "server.etcat" | "server.tailcat" | "")
+    {
         (
             fixed.as_deref().context(
-                "server.etcat requires a fixed connection token argument to 'etcat socks'",
+                "the server magic hostname requires a fixed token argument to 'etcat socks'",
             )?,
             Destination::ServerPort { port },
         )
-    } else if host.starts_with(crate::token::TOKEN_PREFIX) && !host.contains('.') {
+    } else if let Ok(token) = decode_token(&host) {
         dynamic = ClientSession::start(
-            decode_token(&host)?,
+            token,
             options.relay_file.as_deref(),
             options.key_name.as_deref(),
         )
@@ -1118,17 +1214,23 @@ async fn resolve_target(value: &str) -> Result<ConnectionToken> {
             .flat_map(|part| part.iter().copied())
             .collect::<Vec<_>>();
         let text = String::from_utf8(text).context("DNS TXT record is not UTF-8")?;
-        if let Some(token) = text.trim().strip_prefix("etcat=") {
+        let text = text.trim();
+        if let Some(token) = text
+            .strip_prefix("etcat=")
+            .or_else(|| text.strip_prefix("tailcat="))
+        {
             return decode_token(token.trim());
         }
     }
-    anyhow::bail!("no 'etcat=' TXT record found for {value:?}")
+    anyhow::bail!("no 'etcat=' or 'tailcat=' TXT record found for {value:?}")
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
+    #[cfg(unix)]
     #[test]
     fn address_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -1142,5 +1244,72 @@ mod tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn socks_listen_addresses_match_tailcat_forms() {
+        assert_eq!(normalize_listen_address("1080").unwrap(), "127.0.0.1:1080");
+        assert_eq!(
+            normalize_listen_address("127.0.0.1").unwrap(),
+            "127.0.0.1:0"
+        );
+        assert_eq!(normalize_listen_address(":1080").unwrap(), "0.0.0.0:1080");
+        assert_eq!(
+            normalize_listen_address("localhost").unwrap(),
+            "localhost:0"
+        );
+        assert_eq!(normalize_listen_address("").unwrap(), "0.0.0.0:0");
+    }
+
+    #[test]
+    fn allow_none_issues_no_usable_credentials() {
+        let cli = Cli::try_parse_from(["etcat", "--allow=none"]).unwrap();
+        let material = ServerMaterial {
+            identity: PrivateServerIdentity::generate(),
+            credential_secret: generate_credential_secret(),
+            relay: Relay {
+                id: "test".to_owned(),
+                region: "test".to_owned(),
+                endpoints: vec!["tcp://127.0.0.1:11010".parse().unwrap()],
+                probe: "127.0.0.1:11010".to_owned(),
+                public_key: None,
+                priority: 0,
+            },
+            saved_gateway_port: None,
+            saved_key_name: None,
+        };
+
+        let (credentials, _, authentication_keys) =
+            prepare_credentials_and_token(&cli, &material, 49_152, None).unwrap();
+        assert!(credentials.is_empty());
+        assert!(authentication_keys.is_empty());
+    }
+
+    #[test]
+    fn resolved_sealed_tokens_remain_decryptable() {
+        let private_key = generate_client_key();
+        let public_key = client_public_key(&private_key).unwrap();
+        let cli = Cli::try_parse_from(["etcat", &format!("--allow={public_key}")]).unwrap();
+        let registry = RelayRegistry::load(None).unwrap();
+        let relay = registry.get("official-global").unwrap().clone();
+        let material = ServerMaterial {
+            identity: PrivateServerIdentity::generate(),
+            credential_secret: generate_credential_secret(),
+            relay,
+            saved_gateway_port: None,
+            saved_key_name: None,
+        };
+        let (_, token, _) = prepare_credentials_and_token(&cli, &material, 49_152, None).unwrap();
+        let resolved = token.resolve(&registry).unwrap();
+        let CredentialEnvelope::Sealed { recipients } = &resolved.credential else {
+            panic!("expected sealed credential")
+        };
+
+        open_credential(
+            &private_key,
+            &recipients[0],
+            &resolved.credential_aad().unwrap(),
+        )
+        .unwrap();
     }
 }

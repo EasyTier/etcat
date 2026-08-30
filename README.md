@@ -20,6 +20,7 @@ Rust 1.88 or newer is required. EasyTier is pinned to commit
 ```console
 cargo build --release
 ./target/release/etcat --help
+./target/release/etcat --readme
 ```
 
 Linux, macOS, and Windows are supported. The built-in no-auth SSH server is
@@ -91,8 +92,9 @@ client$ etcat socks etc1... curl http://server.etcat:8080/
 
 The first form puts a compact registry-relative bearer token directly in the
 hostname. The fixed-token `server.etcat` form also works with longer sealed or
-`--full-address` tokens. To reach arbitrary TCP destinations visible from the
-server, explicitly enable exit-node mode:
+`--full-address` tokens; `server.tailcat` is accepted as a compatibility alias.
+To reach arbitrary TCP destinations visible from the server, explicitly enable
+exit-node mode:
 
 ```console
 server$ etcat --serve=exit-node
@@ -123,8 +125,9 @@ etcat=etc1...
 
 `--full-address` embeds the selected relay metadata. Otherwise the token stores
 the relay ID and clients resolve it through their local `relays.toml`. Tokens
-use compact CBOR tuples and derive the network name and virtual addresses from
-the pinned server signing key instead of repeating them in the token.
+use compact CBOR tuples and lowercase Base32 hostname labels. They derive the
+network name and virtual addresses from the pinned server signing key instead
+of repeating them in the token.
 
 ## Key management and client authorization
 
@@ -159,6 +162,7 @@ Multiple `--allow` values are supported. Each recipient gets a distinct
 EasyTier credential sealed with HPKE. Clients automatically use
 `client-default`, or a named identity selected with `--key`. Key files and
 `ETCAT_ADDR_FILE` token files are written with mode `0600` on Unix.
+`--allow=none` starts a server that issues no usable client credential.
 
 `--ttl=30m` adds an absolute credential expiry. Without `--ttl`, an ephemeral
 token is process-bound because its credential exists only in the running
@@ -200,13 +204,26 @@ the relay is encrypted but unpinned and etcat prints a warning. The bundled
   credentials. Credential clients cannot advertise proxy routes, and client
   ACLs reject gateway traffic routed to another credential peer. An independent
   Ed25519-signed gateway handshake pins the exact server identity carried in the
-  token and authorizes each logical destination.
+  token and authorizes each logical destination. Requests also carry an HMAC
+  derived from the EasyTier credential, preventing local processes from
+  bypassing the overlay through etcat's loopback gateway.
 - Shared relays provide rendezvous and fallback transport. A pinned relay key
   authenticates the relay; an unpinned registry entry does not.
 - `--serve=all`, `--serve=exit-node`, and `--serve=no-auth-ssh` grant broad
   capabilities to anyone who can open the token. Use them intentionally.
 - No-availability guarantee is implied for community shared relays. A private,
   pinned EasyTier relay is recommended for durable use.
+
+## Tailcat CLI compatibility
+
+Tailcat's user-facing workflows work with `tailcat` replaced by `etcat`,
+including pipe, served ports, ping, SOCKS, SSH, parse, resolve, key management,
+`--readme`, `--allow=none`, and the common genkey flag aliases. EasyTier-specific
+relay configuration remains `--relay-file`, `--relay`, and `--fixed-relay`.
+The native names are `etc1...`, `server.etcat`, `ETCAT_ADDR_FILE`, and
+`etcat=etc1...` DNS TXT records; the corresponding Tailcat environment,
+hostname, and TXT labels are accepted as compatibility aliases where they are
+unambiguous.
 
 ## License
 

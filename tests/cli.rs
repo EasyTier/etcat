@@ -37,6 +37,34 @@ fn built_in_relay_registry_is_visible() {
 }
 
 #[test]
+fn readme_flag_prints_embedded_documentation() {
+    etcat()
+        .arg("--readme")
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("# etcat"));
+}
+
+#[test]
+fn serve_rejects_positional_client_arguments() {
+    etcat()
+        .args(["--serve=8080", "etc1invalid"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no positional arguments are valid along with --serve",
+        ));
+
+    etcat()
+        .args(["--serve=8080", "ping", "etc1invalid"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no positional arguments are valid along with --serve",
+        ));
+}
+
+#[test]
 fn client_key_creation_refuses_an_accidental_overwrite() {
     let directory = tempfile::tempdir().unwrap();
     let configure = |command: &mut Command| {
@@ -61,4 +89,29 @@ fn client_key_creation_refuses_an_accidental_overwrite() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn genkey_accepts_an_explicit_private_key_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let key_path = directory.path().join("explicit.private.json");
+
+    etcat()
+        .args(["genkey", "--client", "--key"])
+        .arg(&key_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("etcp1"));
+    assert!(key_path.exists());
+}
+
+#[test]
+fn genkey_delete_requires_an_explicit_key_name() {
+    etcat()
+        .args(["genkey", "--delete"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "genkey --delete requires --key=<name>",
+        ));
 }
