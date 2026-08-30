@@ -245,30 +245,27 @@ async fn run_server(cli: &Cli) -> Result<()> {
     };
     let gateway_port = gateway.local_addr()?.port();
     let expires_unix = expiry_from_ttl(cli.ttl.as_deref())?;
-    let (credentials, token, authentication_keys) =
-        prepare_credentials_and_token(cli, &material, gateway_port, expires_unix)?;
+    let initial_relay = material
+        .relays
+        .first()
+        .expect("server relay candidates are never empty");
+    let (credentials, credential_token, authentication_keys) =
+        prepare_credentials_and_token(cli, &material, initial_relay, gateway_port, expires_unix)?;
     let access = AccessPolicy {
         destination_ip: material.identity.gateway_ipv4(),
         ports: vec![gateway_port],
     };
-    let config = server_config(&material.identity, &material.relay, credentials, &access)?;
-    let mesh = MeshInstance::start(config).await?;
-    mesh.wait_for_peer_connection(RELAY_CONNECT_TIMEOUT)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to connect to relay {}, {}",
-                material.relay.id, material.relay.region
-            )
-        })?;
+    let (mesh, relay) = connect_server_mesh(&material, &credentials, &access).await?;
+    let token = make_token(
+        &material.identity,
+        credential_token.credential,
+        &relay,
+        gateway_port,
+        cli.full_address,
+        expires_unix,
+    )?;
     let encoded = token.encode()?;
-    report_server_address(
-        cli,
-        &encoded,
-        &material.relay,
-        material.saved_key_name.as_deref(),
-    )
-    .await?;
+    report_server_address(cli, &encoded, &relay, material.saved_key_name.as_deref()).await?;
 
     let signing_key = Arc::new(material.identity.signing_key()?);
     let authentication_keys = Arc::new(authentication_keys);
@@ -326,9 +323,47 @@ async fn run_server(cli: &Cli) -> Result<()> {
 struct ServerMaterial {
     identity: PrivateServerIdentity,
     credential_secret: String,
-    relay: Relay,
+    relays: Vec<Relay>,
     saved_gateway_port: Option<u16>,
     saved_key_name: Option<String>,
+}
+
+async fn connect_server_mesh(
+    material: &ServerMaterial,
+    credentials: &[ManagedCredentialConfig],
+    access: &AccessPolicy,
+) -> Result<(MeshInstance, Relay)> {
+    let mut failures = Vec::with_capacity(material.relays.len());
+    for relay in &material.relays {
+        let config = match server_config(&material.identity, relay, credentials.to_vec(), access) {
+            Ok(config) => config,
+            Err(error) => {
+                failures.push(format!("{}: {error:#}", relay.id));
+                continue;
+            }
+        };
+        let mesh = match MeshInstance::start(config).await {
+            Ok(mesh) => mesh,
+            Err(error) => {
+                failures.push(format!("{}: {error:#}", relay.id));
+                continue;
+            }
+        };
+        match mesh
+            .wait_for_relay_connection(relay, RELAY_CONNECT_TIMEOUT)
+            .await
+        {
+            Ok(()) => return Ok((mesh, relay.clone())),
+            Err(error) => {
+                mesh.stop().await;
+                failures.push(format!("{}: {error:#}", relay.id));
+            }
+        }
+    }
+    anyhow::bail!(
+        "failed to connect to any reachable relay ({})",
+        failures.join("; ")
+    )
 }
 
 async fn server_material(cli: &Cli, registry: &RelayRegistry) -> Result<ServerMaterial> {
@@ -344,17 +379,17 @@ async fn server_material(cli: &Cli, registry: &RelayRegistry) -> Result<ServerMa
         let SavedKey::Server(saved) = saved else {
             anyhow::bail!("selected key is a client key")
         };
-        let relay = if saved.fixed_relay {
-            registry.get(&saved.relay_id).cloned().with_context(|| {
+        let relays = if saved.fixed_relay {
+            vec![registry.get(&saved.relay_id).cloned().with_context(|| {
                 format!("saved relay {:?} is not in the registry", saved.relay_id)
-            })?
+            })?]
         } else {
-            registry.select(None).await?
+            registry.select_candidates(None).await?
         };
         return Ok(ServerMaterial {
             identity: saved.identity,
             credential_secret: saved.credential_secret,
-            relay,
+            relays,
             saved_gateway_port: Some(saved.gateway_port),
             saved_key_name: Some(key_name),
         });
@@ -362,7 +397,7 @@ async fn server_material(cli: &Cli, registry: &RelayRegistry) -> Result<ServerMa
     Ok(ServerMaterial {
         identity: PrivateServerIdentity::generate(),
         credential_secret: generate_credential_secret(),
-        relay: registry.select(None).await?,
+        relays: registry.select_candidates(None).await?,
         saved_gateway_port: None,
         saved_key_name: None,
     })
@@ -408,6 +443,7 @@ fn make_token(
 fn prepare_credentials_and_token(
     cli: &Cli,
     material: &ServerMaterial,
+    relay: &Relay,
     gateway_port: u16,
     expires_unix: Option<i64>,
 ) -> Result<(Vec<ManagedCredentialConfig>, ConnectionToken, Vec<[u8; 32]>)> {
@@ -434,7 +470,7 @@ fn prepare_credentials_and_token(
             CredentialEnvelope::Bearer {
                 secret: material.credential_secret.clone(),
             },
-            &material.relay,
+            relay,
             gateway_port,
             cli.full_address,
             expires_unix,
@@ -475,7 +511,7 @@ fn prepare_credentials_and_token(
         CredentialEnvelope::Sealed {
             recipients: Vec::new(),
         },
-        &material.relay,
+        relay,
         gateway_port,
         cli.full_address,
         expires_unix,
@@ -1344,20 +1380,21 @@ mod tests {
         let material = ServerMaterial {
             identity: PrivateServerIdentity::generate(),
             credential_secret: generate_credential_secret(),
-            relay: Relay {
+            relays: vec![Relay {
                 id: "test".to_owned(),
                 region: "test".to_owned(),
                 endpoints: vec!["tcp://127.0.0.1:11010".parse().unwrap()],
                 probe: "127.0.0.1:11010".to_owned(),
                 public_key: None,
                 priority: 0,
-            },
+            }],
             saved_gateway_port: None,
             saved_key_name: None,
         };
 
         let (credentials, _, authentication_keys) =
-            prepare_credentials_and_token(&cli, &material, 49_152, None).unwrap();
+            prepare_credentials_and_token(&cli, &material, &material.relays[0], 49_152, None)
+                .unwrap();
         assert!(credentials.is_empty());
         assert!(authentication_keys.is_empty());
     }
@@ -1366,17 +1403,28 @@ mod tests {
     fn resolved_sealed_tokens_remain_decryptable() {
         let private_key = generate_client_key();
         let public_key = client_public_key(&private_key).unwrap();
-        let cli = Cli::try_parse_from(["etcat", &format!("--allow={public_key}")]).unwrap();
+        let cli =
+            Cli::try_parse_from(["etcat", "--full-address", &format!("--allow={public_key}")])
+                .unwrap();
         let registry = RelayRegistry::load(None).unwrap();
-        let relay = registry.get("official-global").unwrap().clone();
+        let relay = Relay {
+            id: "test".to_owned(),
+            region: "test".to_owned(),
+            endpoints: vec!["tcp://127.0.0.1:11010".parse().unwrap()],
+            probe: "127.0.0.1:11010".to_owned(),
+            public_key: None,
+            priority: 0,
+        };
         let material = ServerMaterial {
             identity: PrivateServerIdentity::generate(),
             credential_secret: generate_credential_secret(),
-            relay,
+            relays: vec![relay],
             saved_gateway_port: None,
             saved_key_name: None,
         };
-        let (_, token, _) = prepare_credentials_and_token(&cli, &material, 49_152, None).unwrap();
+        let (_, token, _) =
+            prepare_credentials_and_token(&cli, &material, &material.relays[0], 49_152, None)
+                .unwrap();
         let resolved = token.resolve(&registry).unwrap();
         let CredentialEnvelope::Sealed { recipients } = &resolved.credential else {
             panic!("expected sealed credential")

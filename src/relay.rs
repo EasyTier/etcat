@@ -42,10 +42,6 @@ impl RelayRegistry {
         if file.version != 1 {
             anyhow::bail!("unsupported relay registry version {}", file.version);
         }
-        if file.relay.is_empty() {
-            anyhow::bail!("relay registry is empty");
-        }
-
         let mut ids = std::collections::HashSet::new();
         for relay in &file.relay {
             if relay.id.is_empty() || !ids.insert(relay.id.clone()) {
@@ -74,11 +70,24 @@ impl RelayRegistry {
     }
 
     pub async fn select(&self, requested: Option<&str>) -> Result<Relay> {
+        Ok(self
+            .select_candidates(requested)
+            .await?
+            .into_iter()
+            .next()
+            .expect("relay candidates are never empty"))
+    }
+
+    pub async fn select_candidates(&self, requested: Option<&str>) -> Result<Vec<Relay>> {
         if let Some(id) = requested {
             return self
                 .get(id)
                 .cloned()
+                .map(|relay| vec![relay])
                 .with_context(|| format!("relay {id:?} is not in this registry"));
+        }
+        if self.relays.is_empty() {
+            anyhow::bail!("relay registry is empty; provide one with --relay-file");
         }
 
         let relays = Arc::new(self.relays.clone());
@@ -107,20 +116,23 @@ impl RelayRegistry {
             });
         }
 
-        let mut best = None;
+        let mut reachable = Vec::new();
         let mut failures = vec![None; self.relays.len()];
         while let Some(result) = probes.join_next().await {
             let (index, rtt, error) = result.context("relay probe task failed")?;
             if let Some(rtt) = rtt {
-                if best.is_none_or(|(_, best_rtt)| rtt < best_rtt) {
-                    best = Some((index, rtt));
-                }
+                reachable.push((index, rtt));
             } else {
                 failures[index] = error;
             }
         }
-        if let Some((index, _)) = best {
-            return Ok(self.relays[index].clone());
+        if !reachable.is_empty() {
+            reachable
+                .sort_unstable_by_key(|&(index, rtt)| (rtt, self.relays[index].priority, index));
+            return Ok(reachable
+                .into_iter()
+                .map(|(index, _)| self.relays[index].clone())
+                .collect());
         }
 
         let failures = self
@@ -156,9 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_is_valid() {
+    fn built_in_registry_does_not_advertise_an_unverified_relay() {
         let registry = RelayRegistry::load(None).unwrap();
-        assert!(!registry.relays().is_empty());
+        assert!(registry.relays().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_explains_an_empty_registry() {
+        let registry = RelayRegistry { relays: Vec::new() };
+
+        let error = registry.select(None).await.unwrap_err().to_string();
+
+        assert!(error.contains("relay registry is empty"));
+        assert!(error.contains("--relay-file"));
     }
 
     #[tokio::test]
@@ -189,5 +211,32 @@ mod tests {
         };
 
         assert_eq!(registry.select(None).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_keeps_all_reachable_candidates() {
+        let first_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let second_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let registry = RelayRegistry {
+            relays: vec![
+                relay("first", first_listener.local_addr().unwrap().to_string()),
+                relay("second", second_listener.local_addr().unwrap().to_string()),
+            ],
+        };
+
+        let mut ids = registry
+            .select_candidates(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|relay| relay.id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        assert_eq!(ids, ["first", "second"]);
     }
 }

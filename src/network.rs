@@ -44,7 +44,7 @@ impl MeshInstance {
         &self.core
     }
 
-    pub async fn wait_for_peer_connection(&self, timeout: Duration) -> Result<()> {
+    pub async fn wait_for_relay_connection(&self, relay: &Relay, timeout: Duration) -> Result<()> {
         tokio::time::timeout(timeout, async {
             loop {
                 if self
@@ -52,7 +52,18 @@ impl MeshInstance {
                     .peer_snapshots()
                     .await
                     .iter()
-                    .any(|peer| !peer.conns.is_empty())
+                    .flat_map(|peer| &peer.conns)
+                    .any(|conn| {
+                        is_live_relay_connection(
+                            conn.is_closed,
+                            conn.is_client,
+                            conn.tunnel
+                                .as_ref()
+                                .and_then(|tunnel| tunnel.remote_addr.as_ref())
+                                .map(|remote| remote.url.as_str()),
+                            relay,
+                        )
+                    })
                 {
                     return;
                 }
@@ -60,12 +71,33 @@ impl MeshInstance {
             }
         })
         .await
-        .with_context(|| format!("no EasyTier peer connected within {timeout:?}"))
+        .with_context(|| {
+            format!(
+                "no EasyTier connection to relay {} established within {timeout:?}",
+                relay.id
+            )
+        })
     }
 
     pub async fn stop(&self) {
         self.core.stop().await;
     }
+}
+
+fn is_live_relay_connection(
+    is_closed: bool,
+    is_client: bool,
+    remote_addr: Option<&str>,
+    relay: &Relay,
+) -> bool {
+    !is_closed
+        && is_client
+        && remote_addr.is_some_and(|remote| {
+            relay
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.as_str() == remote)
+        })
 }
 
 impl Drop for MeshInstance {
@@ -334,6 +366,22 @@ mod tests {
             make_config(&credential).get_id(),
             make_config(&generate_credential_secret()).get_id()
         );
+    }
+
+    #[test]
+    fn relay_readiness_requires_a_live_outgoing_connection_to_that_relay() {
+        let relay = relay();
+        let endpoint = Some("tcp://127.0.0.1:11010");
+
+        assert!(is_live_relay_connection(false, true, endpoint, &relay));
+        assert!(!is_live_relay_connection(
+            false,
+            true,
+            Some("tcp://127.0.0.1:22020"),
+            &relay
+        ));
+        assert!(!is_live_relay_connection(false, false, endpoint, &relay));
+        assert!(!is_live_relay_connection(true, true, endpoint, &relay));
     }
 
     #[test]

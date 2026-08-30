@@ -26,14 +26,8 @@ fn invalid_connection_token_fails_before_network_startup() {
 }
 
 #[test]
-fn built_in_relay_registry_is_visible() {
-    etcat()
-        .arg("relays")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "official-global\tGlobal\tencrypted-unpinned",
-        ));
+fn built_in_relay_registry_does_not_advertise_unverified_relays() {
+    etcat().arg("relays").assert().success().stdout("");
 }
 
 #[test]

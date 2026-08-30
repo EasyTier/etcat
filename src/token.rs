@@ -503,7 +503,20 @@ mod tests {
 
     #[test]
     fn resolves_registry_reference() {
-        let registry = RelayRegistry::load(None).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            br#"version = 1
+
+[[relay]]
+id = "official-global"
+region = "test"
+probe = "127.0.0.1:11010"
+endpoints = ["tcp://127.0.0.1:11010"]
+"#,
+        )
+        .unwrap();
+        let registry = RelayRegistry::load(Some(file.path())).unwrap();
         let original = sample();
         let original_aad = original.credential_aad().unwrap();
         let token = original.resolve(&registry).unwrap();

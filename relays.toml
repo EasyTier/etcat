@@ -1,11 +1,2 @@
 version = 1
-
-[[relay]]
-id = "official-global"
-region = "Global"
-probe = "public.easytier.top:11010"
-priority = 100
-endpoints = [
-  "tcp://public.easytier.top:11010",
-  "udp://public.easytier.top:11010",
-]
+relay = []

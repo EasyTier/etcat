@@ -171,8 +171,10 @@ server restarts.
 
 ## Shared relay registry
 
-The built-in list lives in [`relays.toml`](relays.toml). Override it with
-`--relay-file` or `ETCAT_RELAY_FILE`:
+The built-in list lives in [`relays.toml`](relays.toml). It is intentionally
+empty until a Secure Mode relay has been independently verified; etcat will not
+ship a legacy or merely TCP-reachable endpoint as a working default. Provide a
+registry with `--relay-file` or `ETCAT_RELAY_FILE`:
 
 ```toml
 version = 1
@@ -189,12 +191,12 @@ endpoints = [
 public_key = "base64-encoded-32-byte-EasyTier-public-key"
 ```
 
-Relay candidates are probed concurrently with three TCP samples and the lowest
-median RTT wins. Startup fails if every candidate is unreachable. After EasyTier
-starts, etcat waits for a real peer connection before printing the server token.
-When `public_key` is present, EasyTier must authenticate that exact relay key.
-When it is absent, the relay is encrypted but unpinned and etcat prints a
-warning. The bundled `official-global` entry is currently unpinned.
+Relay candidates are probed concurrently with three TCP samples and tried in
+median-RTT order. Startup fails only after every reachable candidate fails its
+EasyTier handshake. etcat prints the server token only after a connection to the
+selected relay is established. When `public_key` is present, EasyTier must
+authenticate that exact relay key. When it is absent, the relay is encrypted but
+unpinned and etcat prints a warning.
 
 ## Security model
 
