@@ -1,0 +1,11 @@
+version = 1
+
+[[relay]]
+id = "local-test"
+region = "Local integration test"
+probe = "127.0.0.1:11110"
+priority = 1
+endpoints = [
+  "tcp://127.0.0.1:11110",
+  "udp://127.0.0.1:11110",
+]
