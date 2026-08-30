@@ -96,6 +96,7 @@ pub fn client_config(
     config.set_id(uuid::Uuid::from_bytes(instance_id));
     config.set_network_identity(NetworkIdentity::new_credential(network_name.to_owned()));
     config.set_secure_mode(Some(secure_mode(credential_secret)?));
+    config.set_acl(Some(build_client_acl()));
     config.set_port_forwards(forwards);
     if let Some(bind) = socks5 {
         config.set_socks5_portal(Some(format!("socks5://{bind}").parse()?));
@@ -178,11 +179,37 @@ fn build_acl(access: &AccessPolicy) -> easytier::proto::acl::Acl {
     }
 }
 
+fn build_client_acl() -> easytier::proto::acl::Acl {
+    use easytier::proto::acl::{Acl, AclV1, Action, Chain, ChainType, GroupInfo, Protocol, Rule};
+
+    Acl {
+        acl_v1: Some(AclV1 {
+            chains: vec![Chain {
+                name: "etcat-admin-only".to_owned(),
+                chain_type: ChainType::Outbound as i32,
+                description: "Reject routes that resolve to credential peers".to_owned(),
+                enabled: true,
+                rules: vec![Rule {
+                    name: "etcat-reject-client-destination".to_owned(),
+                    description: "The gateway must be an EasyTier admin node".to_owned(),
+                    priority: 1000,
+                    enabled: true,
+                    protocol: Protocol::Any as i32,
+                    destination_groups: vec![CLIENT_GROUP.to_owned()],
+                    action: Action::Drop as i32,
+                    ..Default::default()
+                }],
+                default_action: Action::Allow as i32,
+            }],
+            group: Some(GroupInfo::default()),
+        }),
+    }
+}
+
 pub fn managed_credential(
     id: String,
     secret: String,
     groups: Vec<String>,
-    allowed_proxy_cidrs: Vec<String>,
     expiry_unix: i64,
 ) -> ManagedCredentialConfig {
     ManagedCredentialConfig {
@@ -190,7 +217,9 @@ pub fn managed_credential(
         credential_secret: secret,
         groups,
         allow_relay: false,
-        allowed_proxy_cidrs,
+        // Credential peers consume the admin node's gateway route, but must
+        // never be allowed to publish a competing route themselves.
+        allowed_proxy_cidrs: Vec::new(),
         expiry_unix,
         reusable: false,
     }
@@ -249,6 +278,16 @@ mod tests {
         .unwrap();
         assert!(client.get_flags().no_tun);
         assert!(client.get_network_identity().network_secret.is_none());
+        let acl = client.get_acl().unwrap().acl_v1.unwrap();
+        assert_eq!(acl.chains.len(), 1);
+        assert_eq!(
+            acl.chains[0].rules[0].destination_groups,
+            vec![CLIENT_GROUP]
+        );
+        assert_eq!(
+            acl.chains[0].rules[0].action,
+            easytier::proto::acl::Action::Drop as i32
+        );
     }
 
     #[test]
@@ -275,5 +314,17 @@ mod tests {
             make_config(&credential).get_id(),
             make_config(&generate_credential_secret()).get_id()
         );
+    }
+
+    #[test]
+    fn client_credentials_cannot_advertise_proxy_routes() {
+        let credential = managed_credential(
+            "client".to_owned(),
+            generate_credential_secret(),
+            vec![CLIENT_GROUP.to_owned()],
+            i64::MAX,
+        );
+
+        assert!(credential.allowed_proxy_cidrs.is_empty());
     }
 }

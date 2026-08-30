@@ -33,14 +33,12 @@ impl std::fmt::Debug for ServerIdentity {
 
 impl ServerIdentity {
     pub fn generate() -> Self {
-        let mut name = [0_u8; 16];
         let mut secret = [0_u8; 32];
-        OsRng.fill_bytes(&mut name);
         OsRng.fill_bytes(&mut secret);
         let private = StaticSecret::random_from_rng(OsRng);
         let signing = SigningKey::generate(&mut OsRng);
-        let digest = Sha256::digest(name);
-        let server_ipv4 = Ipv4Addr::new(10, digest[0], digest[1], 1);
+        let network_name = network_name_from_signing_key(&signing.verifying_key().to_bytes());
+        let server_ipv4 = server_ipv4_from_network_name(&network_name);
         let hostname = hostname::get()
             .ok()
             .and_then(|value| value.into_string().ok())
@@ -48,7 +46,7 @@ impl ServerIdentity {
             .unwrap_or_else(|| "etcat-server".to_owned());
 
         Self {
-            network_name: format!("etcat-{}", hex::encode(name)),
+            network_name,
             network_secret: STANDARD.encode(secret),
             private_key: STANDARD.encode(private.as_bytes()),
             signing_key: STANDARD.encode(signing.to_bytes()),
@@ -57,19 +55,13 @@ impl ServerIdentity {
         }
     }
 
-    pub fn public_key(&self) -> anyhow::Result<String> {
-        let private = decode_private_key(&self.private_key)?;
-        Ok(STANDARD.encode(PublicKey::from(&private).as_bytes()))
-    }
-
     pub fn client_ipv4(&self, slot: u8) -> Ipv4Addr {
         let octets = self.server_ipv4.octets();
         Ipv4Addr::new(octets[0], octets[1], octets[2], slot.max(2))
     }
 
     pub fn gateway_ipv4(&self) -> Ipv4Addr {
-        let digest = Sha256::digest(self.network_name.as_bytes());
-        Ipv4Addr::new(100, 64 + digest[0] % 64, digest[1], digest[2])
+        gateway_ipv4_from_network_name(&self.network_name)
     }
 
     pub fn signing_key(&self) -> anyhow::Result<SigningKey> {
@@ -83,6 +75,21 @@ impl ServerIdentity {
     pub fn verifying_key(&self) -> anyhow::Result<VerifyingKey> {
         Ok(self.signing_key()?.verifying_key())
     }
+}
+
+pub fn network_name_from_signing_key(public_key: &[u8; 32]) -> String {
+    let digest = Sha256::digest(public_key);
+    format!("etcat-{}", hex::encode(&digest[..16]))
+}
+
+pub fn server_ipv4_from_network_name(network_name: &str) -> Ipv4Addr {
+    let digest = Sha256::digest(network_name.as_bytes());
+    Ipv4Addr::new(10, digest[0], digest[1], 1)
+}
+
+pub fn gateway_ipv4_from_network_name(network_name: &str) -> Ipv4Addr {
+    let digest = Sha256::digest(network_name.as_bytes());
+    Ipv4Addr::new(100, 64 + digest[0] % 64, digest[1], digest[2])
 }
 
 pub fn generate_credential_secret() -> String {
@@ -114,7 +121,11 @@ mod tests {
     #[test]
     fn generated_identity_has_stable_public_material() {
         let identity = ServerIdentity::generate();
-        assert_eq!(identity.public_key().unwrap().len(), 44);
+        assert_eq!(identity.verifying_key().unwrap().to_bytes().len(), 32);
+        assert_eq!(
+            identity.network_name,
+            network_name_from_signing_key(&identity.verifying_key().unwrap().to_bytes())
+        );
         assert_eq!(identity.server_ipv4.octets()[0], 10);
         assert_eq!(identity.client_ipv4(2).octets()[3], 2);
     }

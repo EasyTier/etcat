@@ -1,4 +1,4 @@
-use std::io;
+use std::{future::Future, io};
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -91,23 +91,25 @@ where
     Ok(())
 }
 
-pub async fn server_handshake<S>(
+pub async fn server_handshake<S, F, Fut, T>(
     stream: &mut S,
     network_name: &str,
     signing_key: &SigningKey,
-    authorize: impl FnOnce(&Destination) -> Result<()>,
-) -> Result<Destination>
+    connect: F,
+) -> Result<(Destination, T)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(Destination) -> Fut,
+    Fut: Future<Output = Result<T>>,
 {
     let request_bytes = read_frame(stream).await?;
     let request: GatewayRequest = decode(&request_bytes)?;
     if request.version != 1 {
         anyhow::bail!("unsupported gateway protocol version {}", request.version);
     }
-    let result = authorize(&request.destination);
+    let result = connect(request.destination.clone()).await;
     let (accepted, message) = match &result {
-        Ok(()) => (true, String::new()),
+        Ok(_) => (true, String::new()),
         Err(error) => (false, format!("{error:#}")),
     };
     let transcript = transcript(network_name, &request_bytes, accepted, &message);
@@ -118,7 +120,7 @@ where
     };
     write_frame(stream, &encode(&response)?).await?;
     match result {
-        Ok(()) => Ok(request.destination),
+        Ok(connected) => Ok((request.destination, connected)),
         Err(_) => Err(GatewayHandshakeError::Rejected(message).into()),
     }
 }
@@ -177,9 +179,9 @@ mod tests {
         let verifying = signing.verifying_key();
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_handshake(&mut server, "network", &signing, |destination| {
+            server_handshake(&mut server, "network", &signing, |destination| async move {
                 anyhow::ensure!(
-                    destination == &Destination::ServerPort { port: 80 },
+                    destination == Destination::ServerPort { port: 80 },
                     "not allowed"
                 );
                 Ok(())
@@ -196,7 +198,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             server_task.await.unwrap().unwrap(),
-            Destination::ServerPort { port: 80 }
+            (Destination::ServerPort { port: 80 }, ())
         );
     }
 
@@ -206,8 +208,8 @@ mod tests {
         let verifying = signing.verifying_key();
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
-            server_handshake(&mut server, "network", &signing, |_| {
-                anyhow::bail!("blocked")
+            server_handshake(&mut server, "network", &signing, |_| async {
+                Err::<(), _>(anyhow::anyhow!("blocked"))
             })
             .await
         });
@@ -226,5 +228,34 @@ mod tests {
                 .downcast_ref::<GatewayHandshakeError>()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn success_waits_until_the_destination_is_connected() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let verifying = signing.verifying_key();
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server_handshake(&mut server, "network", &signing, |_| async {
+                connected_rx.await.context("destination signal was dropped")
+            })
+            .await
+        });
+        let client_task = tokio::spawn(async move {
+            client_handshake(
+                &mut client,
+                "network",
+                Destination::ServerPort { port: 80 },
+                &verifying,
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!client_task.is_finished());
+        connected_tx.send(()).unwrap();
+        client_task.await.unwrap().unwrap();
+        server_task.await.unwrap().unwrap();
     }
 }

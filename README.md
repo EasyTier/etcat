@@ -85,11 +85,14 @@ Run a command with `all_proxy` pointing at a temporary local SOCKS5 listener:
 
 ```console
 server$ etcat --serve=8080
+client$ etcat socks curl http://etc1...:8080/
 client$ etcat socks etc1... curl http://server.etcat:8080/
 ```
 
-`server.etcat` addresses the server side. To reach arbitrary TCP destinations
-visible from the server, explicitly enable exit-node mode:
+The first form puts a compact registry-relative bearer token directly in the
+hostname. The fixed-token `server.etcat` form also works with longer sealed or
+`--full-address` tokens. To reach arbitrary TCP destinations visible from the
+server, explicitly enable exit-node mode:
 
 ```console
 server$ etcat --serve=exit-node
@@ -119,7 +122,9 @@ etcat=etc1...
 ```
 
 `--full-address` embeds the selected relay metadata. Otherwise the token stores
-the relay ID and clients resolve it through their local `relays.toml`.
+the relay ID and clients resolve it through their local `relays.toml`. Tokens
+use compact CBOR tuples and derive the network name and virtual addresses from
+the pinned server signing key instead of repeating them in the token.
 
 ## Key management and client authorization
 
@@ -192,8 +197,10 @@ the relay is encrypted but unpinned and etcat prints a warning. The bundled
   logs, issue trackers, and process arguments on shared machines. Prefer
   `--allow` when a token will be published in DNS or retained long term.
 - EasyTier secure mode encrypts the overlay and admits clients with managed
-  credentials. An independent Ed25519-signed gateway handshake pins the server
-  identity carried in the token and authorizes each logical destination.
+  credentials. Credential clients cannot advertise proxy routes, and client
+  ACLs reject gateway traffic routed to another credential peer. An independent
+  Ed25519-signed gateway handshake pins the exact server identity carried in the
+  token and authorizes each logical destination.
 - Shared relays provide rendezvous and fallback transport. A pinned relay key
   authenticates the relay; an unpinned registry entry does not.
 - `--serve=all`, `--serve=exit-node`, and `--serve=no-auth-ssh` grant broad
