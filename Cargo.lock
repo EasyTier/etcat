@@ -1810,6 +1810,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "which",
  "x25519-dalek 2.0.1",
 ]
 
