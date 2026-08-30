@@ -509,7 +509,9 @@ async fn report_server_address(
     }
     if let Some(destination) = std::env::var("ETCAT_ADDR_FILE")
         .ok()
+        .filter(|value| !value.is_empty())
         .or_else(|| std::env::var("TAILCAT_ADDR_FILE").ok())
+        .filter(|value| !value.is_empty())
     {
         if let Some(address) = destination.strip_prefix("tcp:") {
             let mut stream = TcpStream::connect(address).await?;
@@ -781,7 +783,8 @@ struct ClientOptions {
 async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
     let mut program = args.args.as_slice();
     let fixed_token = if let Some(first) = program.first()
-        && (first.starts_with(crate::token::TOKEN_PREFIX) || first.contains('.'))
+        && (first.starts_with(crate::token::TOKEN_PREFIX)
+            || (first.contains('.') && !command_exists(first)))
     {
         match resolve_target(first).await {
             Ok(token) => {
@@ -838,6 +841,16 @@ async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
 
     eprintln!("SOCKS running at {proxy_url}");
     serve_socks(listener, fixed, options).await
+}
+
+fn command_exists(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|path_var| {
+        std::env::split_paths(&path_var).any(|directory| directory.join(command).is_file())
+    })
 }
 
 async fn run_ssh(args: &crate::cli::SshArgs, cli: &Cli) -> Result<()> {
@@ -1174,7 +1187,10 @@ fn expiry_from_ttl(value: Option<&str>) -> Result<Option<i64>> {
         return Ok(None);
     };
     let ttl = humantime::parse_duration(value).context("invalid --ttl")?;
-    anyhow::ensure!(!ttl.is_zero(), "--ttl must be positive");
+    anyhow::ensure!(
+        ttl >= Duration::from_secs(1),
+        "--ttl must be at least one second"
+    );
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let expiry = now
         .checked_add(ttl.as_secs())
@@ -1259,6 +1275,18 @@ mod tests {
             "localhost:0"
         );
         assert_eq!(normalize_listen_address("").unwrap(), "0.0.0.0:0");
+    }
+
+    #[test]
+    fn explicit_commands_with_dots_are_not_dns_targets() {
+        let executable = std::env::current_exe().unwrap();
+        assert!(command_exists(executable.to_str().unwrap()));
+    }
+
+    #[test]
+    fn subsecond_ttl_is_rejected() {
+        assert!(expiry_from_ttl(Some("500ms")).is_err());
+        assert!(expiry_from_ttl(Some("1s")).unwrap().is_some());
     }
 
     #[test]
