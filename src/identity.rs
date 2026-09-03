@@ -2,10 +2,16 @@ use std::net::Ipv4Addr;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hkdf::Hkdf;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+const CREDENTIAL_SEED_LEN: usize = 16;
+const CREDENTIAL_KDF_SALT: &[u8] = b"etcat credential v2";
+const EASYTIER_CREDENTIAL_INFO: &[u8] = b"easytier x25519 private key";
+const GATEWAY_AUTHENTICATION_INFO: &[u8] = b"gateway hmac-sha256 key";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServerIdentity {
@@ -78,8 +84,18 @@ impl ServerIdentity {
 }
 
 pub fn network_name_from_signing_key(public_key: &[u8; 32]) -> String {
+    network_name_from_fingerprint(&server_fingerprint(public_key))
+}
+
+pub fn network_name_from_fingerprint(fingerprint: &[u8; 16]) -> String {
+    format!("etcat-{}", hex::encode(fingerprint))
+}
+
+pub fn server_fingerprint(public_key: &[u8; 32]) -> [u8; 16] {
     let digest = Sha256::digest(public_key);
-    format!("etcat-{}", hex::encode(&digest[..16]))
+    let mut fingerprint = [0_u8; 16];
+    fingerprint.copy_from_slice(&digest[..16]);
+    fingerprint
 }
 
 pub fn server_ipv4_from_network_name(network_name: &str) -> Ipv4Addr {
@@ -93,8 +109,29 @@ pub fn gateway_ipv4_from_network_name(network_name: &str) -> Ipv4Addr {
 }
 
 pub fn generate_credential_secret() -> String {
-    let private = StaticSecret::random_from_rng(OsRng);
-    STANDARD.encode(private.as_bytes())
+    let mut seed = [0_u8; CREDENTIAL_SEED_LEN];
+    OsRng.fill_bytes(&mut seed);
+    STANDARD.encode(seed)
+}
+
+pub fn easytier_credential_secret(secret: &str) -> anyhow::Result<String> {
+    Ok(STANDARD.encode(derive_credential_key(secret, EASYTIER_CREDENTIAL_INFO)?))
+}
+
+pub fn credential_authentication_key(secret: &str) -> anyhow::Result<[u8; 32]> {
+    derive_credential_key(secret, GATEWAY_AUTHENTICATION_INFO)
+}
+
+fn derive_credential_key(secret: &str, info: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let seed: [u8; CREDENTIAL_SEED_LEN] = STANDARD
+        .decode(secret)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("credential seed must contain 16 bytes"))?;
+    let mut key = [0_u8; 32];
+    Hkdf::<Sha256>::new(Some(CREDENTIAL_KDF_SALT), &seed)
+        .expand(info, &mut key)
+        .map_err(|_| anyhow::anyhow!("failed to derive credential key"))?;
+    Ok(key)
 }
 
 pub fn secure_mode(private_key: &str) -> anyhow::Result<easytier::proto::common::SecureModeConfig> {
@@ -128,6 +165,24 @@ mod tests {
         );
         assert_eq!(identity.server_ipv4.octets()[0], 10);
         assert_eq!(identity.client_ipv4(2).octets()[3], 2);
+    }
+
+    #[test]
+    fn compact_credentials_derive_separate_stable_keys() {
+        let seed = STANDARD.encode([0_u8; CREDENTIAL_SEED_LEN]);
+
+        assert_eq!(
+            hex::encode(
+                STANDARD
+                    .decode(easytier_credential_secret(&seed).unwrap())
+                    .unwrap()
+            ),
+            "3efee006dec6d10e5d1fd453a4201ddbedbb572740366eb272ea16223be1a1cf"
+        );
+        assert_eq!(
+            hex::encode(credential_authentication_key(&seed).unwrap()),
+            "041ead09fd8c8b5c1a2da25ae499e558f2d03e24c21499148ba74419f58f79d4"
+        );
     }
 
     #[test]

@@ -8,7 +8,6 @@ use std::{
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use easytier::common::config::ManagedCredentialConfig;
-use ed25519_dalek::VerifyingKey;
 use hickory_resolver::{TokioResolver, name_server::TokioConnectionProvider};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional},
@@ -24,7 +23,8 @@ use crate::{
         validate_public_key,
     },
     identity::{
-        ServerIdentity as PrivateServerIdentity, decode_private_key, generate_credential_secret,
+        ServerIdentity as PrivateServerIdentity, credential_authentication_key,
+        generate_credential_secret, server_fingerprint,
     },
     key::{SavedKey, SavedServerKey},
     network::{
@@ -36,6 +36,7 @@ use crate::{
     service::ServePolicy,
     token::{
         ConnectionToken, CredentialEnvelope, RelayLocator, ServerIdentity as TokenServerIdentity,
+        has_token_prefix, recipient_matches_public_key,
     },
 };
 
@@ -102,13 +103,13 @@ fn parse_token(value: &str) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "version": token.version,
+            "version": 2,
             "network_name": token.network_name()?,
             "credential": credential,
             "server": {
                 "virtual_ipv4": token.server_virtual_ipv4()?,
                 "gateway_ipv4": token.gateway_ipv4()?,
-                "public_key": &token.server.public_key,
+                "fingerprint": &token.server.fingerprint,
                 "gateway_port": token.server.gateway_port,
             },
             "relay": &token.relay,
@@ -411,17 +412,19 @@ fn make_token(
     full_address: bool,
     expires_unix: Option<i64>,
 ) -> Result<ConnectionToken> {
+    let public_key = identity.verifying_key()?.to_bytes();
     let token = ConnectionToken {
-        version: 1,
         credential,
         server: TokenServerIdentity {
-            public_key: STANDARD.encode(identity.verifying_key()?.to_bytes()),
+            fingerprint: STANDARD.encode(server_fingerprint(&public_key)),
             gateway_port,
         },
         relay: if full_address {
             RelayLocator::Inline {
                 relay: relay.clone(),
             }
+        } else if let Some(code) = relay.token_id() {
+            RelayLocator::RegistryCode { code }
         } else {
             RelayLocator::Registry {
                 id: relay.id.clone(),
@@ -429,6 +432,7 @@ fn make_token(
         },
         expires_unix,
     };
+    token.credential_aad()?;
     anyhow::ensure!(
         token.network_name()? == identity.network_name,
         "server identity has an inconsistent network name"
@@ -454,17 +458,16 @@ fn prepare_credentials_and_token(
         "--allow=none cannot be combined with client public keys"
     );
     if cli.allow.is_empty() || deny_all {
-        let credentials = (!deny_all)
-            .then(|| {
-                managed_credential(
-                    "etcat-default".to_owned(),
-                    material.credential_secret.clone(),
-                    vec![CLIENT_GROUP.to_owned()],
-                    expiry,
-                )
-            })
-            .into_iter()
-            .collect();
+        let credentials = if deny_all {
+            Vec::new()
+        } else {
+            vec![managed_credential(
+                "etcat-default".to_owned(),
+                &material.credential_secret,
+                vec![CLIENT_GROUP.to_owned()],
+                expiry,
+            )?]
+        };
         let token = make_token(
             &material.identity,
             CredentialEnvelope::Bearer {
@@ -499,10 +502,10 @@ fn prepare_credentials_and_token(
         let secret = generate_credential_secret();
         credentials.push(managed_credential(
             format!("etcat-{index}"),
-            secret.clone(),
+            &secret,
             vec![CLIENT_GROUP.to_owned()],
             expiry,
-        ));
+        )?);
         pending.push((recipient, secret, client_ipv4));
     }
 
@@ -529,10 +532,6 @@ fn prepare_credentials_and_token(
         .collect::<Result<Vec<_>>>()?;
     token.credential = CredentialEnvelope::Sealed { recipients };
     Ok((credentials, token, authentication_keys))
-}
-
-fn credential_authentication_key(secret: &str) -> Result<[u8; 32]> {
-    Ok(decode_private_key(secret)?.to_bytes())
 }
 
 async fn report_server_address(
@@ -710,7 +709,7 @@ struct ClientSession {
     _mesh: MeshInstance,
     gateway: SocketAddr,
     network_name: String,
-    verifying_key: VerifyingKey,
+    server_fingerprint: [u8; 16],
     authentication_key: [u8; 32],
 }
 
@@ -742,17 +741,13 @@ impl ClientSession {
             None,
         )?;
         let mesh = MeshInstance::start(config).await?;
-        let key_bytes: [u8; 32] = STANDARD
-            .decode(&token.server.public_key)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid server identity key"))?;
-        let verifying_key = VerifyingKey::from_bytes(&key_bytes)?;
+        let server_fingerprint = token.server_fingerprint()?;
         wait_for_gateway_route(&mesh, server_ip, Duration::from_secs(30)).await?;
         Ok(Self {
             _mesh: mesh,
             gateway: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port),
             network_name,
-            verifying_key,
+            server_fingerprint,
             authentication_key,
         })
     }
@@ -768,7 +763,7 @@ impl ClientSession {
                     &mut stream,
                     &self.network_name,
                     destination.clone(),
-                    &self.verifying_key,
+                    &self.server_fingerprint,
                     &self.authentication_key,
                 ),
             )
@@ -830,8 +825,7 @@ async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
     let mut program = args.args.as_slice();
     let mut executable = program.first().and_then(resolve_executable);
     let fixed_token = if let Some(first) = program.first()
-        && (first.starts_with(crate::token::TOKEN_PREFIX)
-            || (first.contains('.') && executable.is_none()))
+        && (has_token_prefix(first) || (first.contains('.') && executable.is_none()))
     {
         match resolve_target(first).await {
             Ok(token) => {
@@ -839,7 +833,7 @@ async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
                 executable = program.first().and_then(resolve_executable);
                 Some(token)
             }
-            Err(error) if first.starts_with(crate::token::TOKEN_PREFIX) => return Err(error),
+            Err(error) if has_token_prefix(first) => return Err(error),
             Err(_) => None,
         }
     } else {
@@ -1115,6 +1109,10 @@ fn resolve_relay(token: &ConnectionToken, registry: &RelayRegistry) -> Result<Re
             .get(id)
             .cloned()
             .with_context(|| format!("relay {id:?} is not in this registry")),
+        RelayLocator::RegistryCode { code } => registry
+            .get_by_token_id(*code)
+            .cloned()
+            .with_context(|| format!("relay token ID {code} is not in this registry")),
         RelayLocator::Inline { relay } => Ok(relay.clone()),
     }?;
     if relay.public_key.is_none() {
@@ -1215,11 +1213,21 @@ fn client_credential(token: &ConnectionToken, key_name: Option<&str>) -> Result<
                 anyhow::bail!("selected key is a server key, not a client key")
             };
             let public_key = client_public_key(&client.private_key)?;
-            let sealed = recipients
-                .iter()
-                .find(|sealed| sealed.recipient == public_key)
-                .context("selected client key is not allowed by this token")?;
-            open_credential(&client.private_key, sealed, &token.credential_aad()?)
+            let aad = token.credential_aad()?;
+            let mut matched = false;
+            let mut last_error = None;
+            for sealed in recipients {
+                if !recipient_matches_public_key(&sealed.recipient, &public_key)? {
+                    continue;
+                }
+                matched = true;
+                match open_credential(&client.private_key, sealed, &aad) {
+                    Ok(credential) => return Ok(credential),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            anyhow::ensure!(matched, "selected client key is not allowed by this token");
+            Err(last_error.context("failed to open sealed client credential")?)
         }
     }
 }
@@ -1259,12 +1267,12 @@ fn decode_token(value: &str) -> Result<ConnectionToken> {
 }
 
 async fn resolve_target(value: &str) -> Result<ConnectionToken> {
-    if value.starts_with(crate::token::TOKEN_PREFIX) {
+    if has_token_prefix(value) {
         return decode_token(value);
     }
     anyhow::ensure!(
         value.contains('.'),
-        "argument is neither an etc1 connection token nor a DNS name"
+        "argument is neither an etc2 connection token nor a DNS name"
     );
     let resolver = TokioResolver::builder(TokioConnectionProvider::default())?.build();
     let records = tokio::time::timeout(Duration::from_secs(5), resolver.txt_lookup(value))
@@ -1301,9 +1309,9 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("address");
-        write_private_token(&path, "etc1secret").unwrap();
+        write_private_token(&path, "etc2secret").unwrap();
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "etc1secret");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "etc2secret");
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1387,6 +1395,7 @@ mod tests {
                 probe: "127.0.0.1:11010".to_owned(),
                 public_key: None,
                 priority: 0,
+                token_id: None,
             }],
             saved_gateway_port: None,
             saved_key_name: None,
@@ -1403,9 +1412,7 @@ mod tests {
     fn resolved_sealed_tokens_remain_decryptable() {
         let private_key = generate_client_key();
         let public_key = client_public_key(&private_key).unwrap();
-        let cli =
-            Cli::try_parse_from(["etcat", "--full-address", &format!("--allow={public_key}")])
-                .unwrap();
+        let cli = Cli::try_parse_from(["etcat", &format!("--allow={public_key}")]).unwrap();
         let registry = RelayRegistry::load(None).unwrap();
         let relay = Relay {
             id: "test".to_owned(),
@@ -1414,6 +1421,7 @@ mod tests {
             probe: "127.0.0.1:11010".to_owned(),
             public_key: None,
             priority: 0,
+            token_id: Some(1),
         };
         let material = ServerMaterial {
             identity: PrivateServerIdentity::generate(),
@@ -1425,7 +1433,16 @@ mod tests {
         let (_, token, _) =
             prepare_credentials_and_token(&cli, &material, &material.relays[0], 49_152, None)
                 .unwrap();
-        let resolved = token.resolve(&registry).unwrap();
+        let encoded = token.encode().unwrap();
+        assert!(
+            encoded.len() <= 160,
+            "sealed token is {} characters",
+            encoded.len()
+        );
+        let resolved = ConnectionToken::decode(&encoded)
+            .unwrap()
+            .resolve(&registry)
+            .unwrap();
         let CredentialEnvelope::Sealed { recipients } = &resolved.credential else {
             panic!("expected sealed credential")
         };

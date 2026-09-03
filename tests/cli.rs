@@ -21,8 +21,18 @@ fn invalid_connection_token_fails_before_network_startup() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "neither an etc1 connection token nor a DNS name",
+            "neither an etc2 connection token nor a DNS name",
         ));
+}
+
+#[test]
+fn invalid_compact_token_fails_before_network_startup() {
+    Command::cargo_bin("etcat")
+        .unwrap()
+        .arg("etc2invalid")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("connection token"));
 }
 
 #[test]
@@ -48,7 +58,7 @@ fn readme_flag_prints_embedded_documentation() {
 #[test]
 fn serve_rejects_positional_client_arguments() {
     etcat()
-        .args(["--serve=8080", "etc1invalid"])
+        .args(["--serve=8080", "etc2invalid"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -56,7 +66,7 @@ fn serve_rejects_positional_client_arguments() {
         ));
 
     etcat()
-        .args(["--serve=8080", "ping", "etc1invalid"])
+        .args(["--serve=8080", "ping", "etc2invalid"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(

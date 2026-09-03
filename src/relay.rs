@@ -17,6 +17,8 @@ pub struct Relay {
     pub public_key: Option<String>,
     #[serde(default)]
     pub priority: u16,
+    #[serde(skip)]
+    pub(crate) token_id: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,12 +40,12 @@ impl RelayRegistry {
                 .with_context(|| format!("failed to read relay registry {}", path.display()))?,
             None => BUILTIN_REGISTRY.to_owned(),
         };
-        let file: RelayFile = toml::from_str(&input).context("invalid relay registry")?;
+        let mut file: RelayFile = toml::from_str(&input).context("invalid relay registry")?;
         if file.version != 1 {
             anyhow::bail!("unsupported relay registry version {}", file.version);
         }
         let mut ids = std::collections::HashSet::new();
-        for relay in &file.relay {
+        for relay in &mut file.relay {
             if relay.id.is_empty() || !ids.insert(relay.id.clone()) {
                 anyhow::bail!("relay IDs must be non-empty and unique");
             }
@@ -57,6 +59,9 @@ impl RelayRegistry {
                     anyhow::bail!("relay {} public key must contain 32 bytes", relay.id);
                 }
             }
+            if path.is_none() {
+                relay.token_id = builtin_token_id(&relay.id);
+            }
         }
         Ok(Self { relays: file.relay })
     }
@@ -67,6 +72,12 @@ impl RelayRegistry {
 
     pub fn get(&self, id: &str) -> Option<&Relay> {
         self.relays.iter().find(|relay| relay.id == id)
+    }
+
+    pub fn get_by_token_id(&self, token_id: u16) -> Option<&Relay> {
+        self.relays
+            .iter()
+            .find(|relay| relay.token_id == Some(token_id))
     }
 
     pub async fn select(&self, requested: Option<&str>) -> Result<Relay> {
@@ -152,6 +163,20 @@ impl RelayRegistry {
     }
 }
 
+impl Relay {
+    pub fn token_id(&self) -> Option<u16> {
+        self.token_id
+    }
+}
+
+fn builtin_token_id(id: &str) -> Option<u16> {
+    match id {
+        // Token IDs are permanent protocol numbers. Never reuse an assigned value.
+        "community-1" => Some(1),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +189,7 @@ mod tests {
             probe,
             public_key: None,
             priority: 0,
+            token_id: None,
         }
     }
 
@@ -181,6 +207,28 @@ mod tests {
             ]
         );
         assert!(relay.public_key.is_none());
+        assert_eq!(relay.token_id(), Some(1));
+    }
+
+    #[test]
+    fn custom_registry_cannot_claim_a_builtin_token_id() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            br#"version = 1
+
+[[relay]]
+id = "community-1"
+region = "custom"
+probe = "127.0.0.1:11010"
+endpoints = ["tcp://127.0.0.1:11010"]
+"#,
+        )
+        .unwrap();
+
+        let registry = RelayRegistry::load(Some(file.path())).unwrap();
+        assert_eq!(registry.get("community-1").unwrap().token_id(), None);
+        assert!(registry.get_by_token_id(1).is_none());
     }
 
     #[tokio::test]

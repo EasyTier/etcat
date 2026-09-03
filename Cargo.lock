@@ -1639,7 +1639,7 @@ dependencies = [
  "digest 0.11.3",
  "ff",
  "group",
- "hkdf",
+ "hkdf 0.13.0",
  "hybrid-array",
  "pem-rfc7468",
  "pkcs8 0.11.0",
@@ -1789,6 +1789,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "hickory-resolver",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "hostname",
  "hpke",
@@ -2384,6 +2385,15 @@ dependencies = [
 
 [[package]]
 name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac 0.12.1",
+]
+
+[[package]]
+name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
@@ -2438,7 +2448,7 @@ dependencies = [
  "aead 0.6.1",
  "chacha20poly1305 0.11.0",
  "getrandom 0.4.3",
- "hkdf",
+ "hkdf 0.13.0",
  "hybrid-array",
  "rand_core 0.10.1",
  "sha2 0.11.0",

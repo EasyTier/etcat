@@ -15,7 +15,7 @@ use easytier::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    identity::{ServerIdentity, secure_mode},
+    identity::{ServerIdentity, easytier_credential_secret, secure_mode},
     relay::Relay,
 };
 
@@ -142,12 +142,13 @@ pub fn client_config(
     socks5: Option<SocketAddr>,
 ) -> Result<TomlConfig> {
     let config = base_config(network_name, client_ipv4, "etcat-client", relay)?;
+    let credential_secret = easytier_credential_secret(credential_secret)?;
     let digest = Sha256::digest(credential_secret.as_bytes());
     let mut instance_id = [0_u8; 16];
     instance_id.copy_from_slice(&digest[..16]);
     config.set_id(uuid::Uuid::from_bytes(instance_id));
     config.set_network_identity(NetworkIdentity::new_credential(network_name.to_owned()));
-    config.set_secure_mode(Some(secure_mode(credential_secret)?));
+    config.set_secure_mode(Some(secure_mode(&credential_secret)?));
     config.set_acl(Some(build_client_acl()));
     config.set_port_forwards(forwards);
     if let Some(bind) = socks5 {
@@ -260,13 +261,13 @@ fn build_client_acl() -> easytier::proto::acl::Acl {
 
 pub fn managed_credential(
     id: String,
-    secret: String,
+    secret: &str,
     groups: Vec<String>,
     expiry_unix: i64,
-) -> ManagedCredentialConfig {
-    ManagedCredentialConfig {
+) -> Result<ManagedCredentialConfig> {
+    Ok(ManagedCredentialConfig {
         credential_id: id,
-        credential_secret: secret,
+        credential_secret: easytier_credential_secret(secret)?,
         groups,
         allow_relay: false,
         // Credential peers consume the admin node's gateway route, but must
@@ -274,7 +275,7 @@ pub fn managed_credential(
         allowed_proxy_cidrs: Vec::new(),
         expiry_unix,
         reusable: false,
-    }
+    })
 }
 
 pub fn tcp_forward(bind_port: u16, destination: SocketAddr) -> PortForwardConfig {
@@ -298,6 +299,7 @@ mod tests {
             probe: "127.0.0.1:11010".to_owned(),
             public_key: None,
             priority: 0,
+            token_id: None,
         }
     }
 
@@ -388,10 +390,11 @@ mod tests {
     fn client_credentials_cannot_advertise_proxy_routes() {
         let credential = managed_credential(
             "client".to_owned(),
-            generate_credential_secret(),
+            &generate_credential_secret(),
             vec![CLIENT_GROUP.to_owned()],
             i64::MAX,
-        );
+        )
+        .unwrap();
 
         assert!(credential.allowed_proxy_cidrs.is_empty());
     }

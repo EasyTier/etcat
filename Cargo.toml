@@ -35,6 +35,7 @@ easytier-core = { git = "https://github.com/EasyTier/EasyTier.git", rev = "164e2
 ] }
 hex = "0.4"
 hostname = "0.4"
+hkdf = "0.12"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 hmac = "0.12"
 hickory-resolver = "0.25"

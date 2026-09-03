@@ -1,26 +1,18 @@
+use crate::token::{SealedCredential, client_key_id, recipient_matches_public_key};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hpke::{
     Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable, aead::ChaCha20Poly1305,
     kdf::HkdfSha256, kem::X25519HkdfSha256, single_shot_open, single_shot_seal,
 };
-use serde::{Deserialize, Serialize};
-
-use crate::token::SealedCredential;
 
 const PUBLIC_KEY_PREFIX: &str = "etcp1";
-const HPKE_INFO: &[u8] = b"etcat credential v1";
+const HPKE_INFO: &[u8] = b"etcat credential v2";
+const RECIPIENT_AAD_DOMAIN: &[u8] = b"\0etcat recipient v2\0";
 
 type Kem = X25519HkdfSha256;
 type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CredentialPayload {
-    secret: String,
-    client_ipv4: String,
-}
 
 pub fn generate_client_key() -> String {
     let (private_key, _) = Kem::gen_keypair();
@@ -39,17 +31,24 @@ pub fn seal_credential(
     aad: &[u8],
 ) -> Result<SealedCredential> {
     let public_key = decode_public_key(recipient)?;
-    let payload = CredentialPayload {
-        secret: secret.to_owned(),
-        client_ipv4: client_ipv4.to_owned(),
-    };
-    let mut plaintext = Vec::new();
-    ciborium::into_writer(&payload, &mut plaintext)?;
-    let (encapsulated_key, ciphertext) =
-        single_shot_seal::<Aead, Kdf, Kem>(&OpModeS::Base, &public_key, HPKE_INFO, &plaintext, aad)
-            .map_err(|error| anyhow::anyhow!("failed to seal credential: {error:?}"))?;
+    let recipient = client_key_id(recipient)?;
+    let host = client_host(client_ipv4)?;
+    let plaintext: [u8; 16] = base64::engine::general_purpose::STANDARD
+        .decode(secret)
+        .context("invalid credential seed")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("credential seed must contain 16 bytes"))?;
+    let aad = recipient_aad(aad, &recipient, host);
+    let (encapsulated_key, ciphertext) = single_shot_seal::<Aead, Kdf, Kem>(
+        &OpModeS::Base,
+        &public_key,
+        HPKE_INFO,
+        &plaintext,
+        &aad,
+    )
+    .map_err(|error| anyhow::anyhow!("failed to seal credential: {error:?}"))?;
     Ok(SealedCredential {
-        recipient: recipient.to_owned(),
+        recipient,
         client_ipv4: client_ipv4.to_owned(),
         encapsulated_key: URL_SAFE_NO_PAD.encode(encapsulated_key.to_bytes()),
         ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
@@ -62,8 +61,9 @@ pub fn open_credential(
     aad: &[u8],
 ) -> Result<(String, String)> {
     let private_key = decode_private_key(private_key)?;
+    let public_key = encode_public_key(&Kem::sk_to_pk(&private_key));
     anyhow::ensure!(
-        sealed.recipient == encode_public_key(&Kem::sk_to_pk(&private_key)),
+        recipient_matches_public_key(&sealed.recipient, &public_key)?,
         "credential is sealed to a different client key"
     );
     let encapsulated_key = URL_SAFE_NO_PAD
@@ -74,21 +74,45 @@ pub fn open_credential(
     let ciphertext = URL_SAFE_NO_PAD
         .decode(&sealed.ciphertext)
         .context("invalid HPKE ciphertext")?;
+    let aad = recipient_aad(aad, &sealed.recipient, client_host(&sealed.client_ipv4)?);
     let plaintext = single_shot_open::<Aead, Kdf, Kem>(
         &OpModeR::Base,
         &private_key,
         &encapsulated_key,
         HPKE_INFO,
         &ciphertext,
-        aad,
+        &aad,
     )
     .map_err(|_| anyhow::anyhow!("failed to decrypt credential"))?;
-    let payload: CredentialPayload = ciborium::from_reader(plaintext.as_slice())?;
+    let seed: [u8; 16] = plaintext
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("decrypted credential seed must contain 16 bytes"))?;
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(seed),
+        sealed.client_ipv4.clone(),
+    ))
+}
+
+fn recipient_aad(aad: &[u8], recipient: &str, host: u8) -> Vec<u8> {
+    let mut bytes =
+        Vec::with_capacity(aad.len() + RECIPIENT_AAD_DOMAIN.len() + recipient.len() + 1);
+    bytes.extend_from_slice(aad);
+    bytes.extend_from_slice(RECIPIENT_AAD_DOMAIN);
+    bytes.extend_from_slice(recipient.as_bytes());
+    bytes.push(host);
+    bytes
+}
+
+fn client_host(client_ipv4: &str) -> Result<u8> {
+    let address = client_ipv4
+        .parse::<std::net::Ipv4Addr>()
+        .context("invalid sealed client IPv4 address")?;
+    let host = address.octets()[3];
     anyhow::ensure!(
-        payload.client_ipv4 == sealed.client_ipv4,
-        "sealed client address does not match its envelope"
+        (2..=254).contains(&host),
+        "invalid sealed client address slot"
     );
-    Ok((payload.secret, payload.client_ipv4))
+    Ok(host)
 }
 
 pub fn validate_public_key(value: &str) -> Result<()> {
@@ -129,10 +153,11 @@ mod tests {
     fn seals_to_one_recipient() {
         let private_key = generate_client_key();
         let public_key = client_public_key(&private_key).unwrap();
-        let sealed = seal_credential(&public_key, "secret", "10.1.2.3", b"metadata").unwrap();
+        let secret = base64::engine::general_purpose::STANDARD.encode([7_u8; 16]);
+        let sealed = seal_credential(&public_key, &secret, "10.1.2.3", b"metadata").unwrap();
         assert_eq!(
             open_credential(&private_key, &sealed, b"metadata").unwrap(),
-            ("secret".to_owned(), "10.1.2.3".to_owned())
+            (secret, "10.1.2.3".to_owned())
         );
         assert!(open_credential(&private_key, &sealed, b"different").is_err());
     }

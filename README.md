@@ -33,13 +33,13 @@ when this process exits:
 
 ```console
 server$ etcat --key=new
-# Server listening with address: etc1...
+# Server listening with address: etc2...
 ```
 
 Send data from the client:
 
 ```console
-client$ printf 'hello\n' | etcat etc1...
+client$ printf 'hello\n' | etcat etc2...
 ```
 
 The server writes `hello` to stdout and exits.
@@ -51,7 +51,7 @@ The server can allow individual ports, ranges, or every local TCP port:
 ```console
 server$ etcat --serve=22,8080,9000-9010
 server$ etcat --serve=all
-client$ etcat etc1... 8080
+client$ etcat etc2... 8080
 ```
 
 All destinations are connected on the server as `127.0.0.1:<port>`. EasyTier
@@ -65,8 +65,8 @@ an SSH password or key:
 
 ```console
 server$ etcat --serve=no-auth-ssh
-client$ etcat ssh etc1...
-client$ etcat ssh etc1... uname -a
+client$ etcat ssh etc2...
+client$ etcat ssh etc2... uname -a
 ```
 
 Interactive sessions use a real PTY. The system OpenSSH client is launched with
@@ -77,7 +77,7 @@ To retain normal SSH authentication, expose the system SSH daemon instead:
 
 ```console
 server$ etcat --serve=22
-client$ etcat ssh -p 22 etc1...
+client$ etcat ssh -p 22 etc2...
 ```
 
 ## SOCKS and process-scoped exit access
@@ -86,8 +86,8 @@ Run a command with `all_proxy` pointing at a temporary local SOCKS5 listener:
 
 ```console
 server$ etcat --serve=8080
-client$ etcat socks curl http://etc1...:8080/
-client$ etcat socks etc1... curl http://server.etcat:8080/
+client$ etcat socks curl http://etc2...:8080/
+client$ etcat socks etc2... curl http://server.etcat:8080/
 ```
 
 The first form puts a compact registry-relative bearer token directly in the
@@ -98,7 +98,7 @@ exit-node mode:
 
 ```console
 server$ etcat --serve=exit-node
-client$ etcat socks etc1... curl https://example.com/
+client$ etcat socks etc2... curl https://example.com/
 ```
 
 This affects only the child command or the explicitly printed local SOCKS
@@ -108,10 +108,10 @@ Only SOCKS5 TCP `CONNECT` is supported.
 ## Connectivity, tokens, and DNS
 
 ```console
-etcat ping etc1...
-etcat ping --until-direct --timeout=20s etc1...
-etcat parse etc1...
-etcat resolve etc1...
+etcat ping etc2...
+etcat ping --until-direct --timeout=20s etc2...
+etcat parse etc2...
+etcat resolve etc2...
 etcat relays
 ```
 
@@ -120,14 +120,16 @@ relay. A DNS name is accepted anywhere a token is accepted when its TXT records
 contain:
 
 ```text
-etcat=etc1...
+etcat=etc2...
 ```
 
 `--full-address` embeds the selected relay metadata. Otherwise the token stores
-the relay ID and clients resolve it through their local `relays.toml`. Tokens
-use compact CBOR tuples and lowercase Base32 hostname labels. They derive the
-network name and virtual addresses from the pinned server signing key instead
-of repeating them in the token.
+a permanent built-in relay number or the custom relay ID, and clients resolve
+it through their local `relays.toml`. `etc2` tokens use a fixed binary
+layout and lowercase Base32 hostname labels. A normal bearer token using the
+built-in relay is 65 characters. It carries a 128-bit credential seed and a
+128-bit fingerprint of the server signing key; the gateway returns the full
+public key and proves possession during its signed handshake.
 
 ## Key management and client authorization
 
@@ -200,16 +202,17 @@ unpinned and etcat prints a warning.
 
 ## Security model
 
-- Treat a bearer `etc1...` token like a password. Avoid shell history, public
-  logs, issue trackers, and process arguments on shared machines. Prefer
-  `--allow` when a token will be published in DNS or retained long term.
+- Treat a bearer `etc2...` token like a password. Avoid shell
+  history, public logs, issue trackers, and process arguments on shared
+  machines. Prefer `--allow` when a token will be published in DNS or retained
+  long term.
 - EasyTier secure mode encrypts the overlay and admits clients with managed
   credentials. Credential clients cannot advertise proxy routes, and client
   ACLs reject gateway traffic routed to another credential peer. An independent
   Ed25519-signed gateway handshake pins the exact server identity carried in the
   token and authorizes each logical destination. Requests also carry an HMAC
-  derived from the EasyTier credential, preventing local processes from
-  bypassing the overlay through etcat's loopback gateway.
+  whose key is derived separately from the same token credential, preventing
+  local processes from bypassing the overlay through etcat's loopback gateway.
 - Shared relays provide rendezvous and fallback transport. A pinned relay key
   authenticates the relay; an unpinned registry entry does not.
 - `--serve=all`, `--serve=exit-node`, and `--serve=no-auth-ssh` grant broad
@@ -223,8 +226,8 @@ Tailcat's user-facing workflows work with `tailcat` replaced by `etcat`,
 including pipe, served ports, ping, SOCKS, SSH, parse, resolve, key management,
 `--readme`, `--allow=none`, and the common genkey flag aliases. EasyTier-specific
 relay configuration remains `--relay-file`, `--relay`, and `--fixed-relay`.
-The native names are `etc1...`, `server.etcat`, `ETCAT_ADDR_FILE`, and
-`etcat=etc1...` DNS TXT records; the corresponding Tailcat environment,
+The native names are `etc2...`, `server.etcat`, `ETCAT_ADDR_FILE`, and
+`etcat=etc2...` DNS TXT records; the corresponding Tailcat environment,
 hostname, and TXT labels are accepted as compatibility aliases where they are
 unambiguous.
 
