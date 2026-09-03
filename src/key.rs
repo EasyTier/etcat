@@ -5,10 +5,15 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::identity::ServerIdentity;
+use crate::identity::{CREDENTIAL_SEED_LEN, ServerIdentity};
+
+const LEGACY_CREDENTIAL_SECRET_LEN: usize = 32;
+const CREDENTIAL_MIGRATION_DOMAIN: &[u8] = b"\0etcat credential seed migration v2\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -71,8 +76,32 @@ pub fn load(name: &str) -> Result<SavedKey> {
     let path = key_path(name)?;
     let bytes =
         fs::read(&path).with_context(|| format!("failed to read key {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse key {}", path.display()))
+    let mut key: SavedKey = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse key {}", path.display()))?;
+    if let SavedKey::Server(server) = &mut key {
+        server.credential_secret = normalize_credential_secret(&server.credential_secret)
+            .with_context(|| format!("invalid server key {}", path.display()))?;
+    }
+    Ok(key)
+}
+
+fn normalize_credential_secret(secret: &str) -> Result<String> {
+    let bytes = STANDARD
+        .decode(secret)
+        .context("credential secret is not valid base64")?;
+    match bytes.len() {
+        CREDENTIAL_SEED_LEN => Ok(STANDARD.encode(bytes)),
+        LEGACY_CREDENTIAL_SECRET_LEN => {
+            let mut hasher = Sha256::new();
+            hasher.update(CREDENTIAL_MIGRATION_DOMAIN);
+            hasher.update(bytes);
+            Ok(STANDARD.encode(&hasher.finalize()[..CREDENTIAL_SEED_LEN]))
+        }
+        length => anyhow::bail!(
+            "credential secret must contain {CREDENTIAL_SEED_LEN} bytes, or \
+             {LEGACY_CREDENTIAL_SECRET_LEN} bytes for migration; found {length}"
+        ),
+    }
 }
 
 pub fn save(name: &str, key: &SavedKey, force: bool) -> Result<PathBuf> {
@@ -145,5 +174,45 @@ mod tests {
         assert!(validate_key_name("client-default_2").is_ok());
         assert!(validate_key_name("../secret").is_err());
         assert!(validate_key_name("").is_err());
+    }
+
+    #[test]
+    fn migrates_legacy_credential_secrets_deterministically() {
+        let current = STANDARD.encode([7_u8; CREDENTIAL_SEED_LEN]);
+        assert_eq!(normalize_credential_secret(&current).unwrap(), current);
+
+        let legacy = STANDARD.encode([7_u8; LEGACY_CREDENTIAL_SECRET_LEN]);
+        let migrated = normalize_credential_secret(&legacy).unwrap();
+        assert_eq!(
+            migrated, "ad4hp7Ygwq+BTF42cRUhPg==",
+            "changing this value invalidates migrated persistent credentials"
+        );
+        assert_eq!(
+            STANDARD.decode(migrated).unwrap().len(),
+            CREDENTIAL_SEED_LEN
+        );
+        assert!(normalize_credential_secret(&STANDARD.encode([0_u8; 15])).is_err());
+    }
+
+    #[test]
+    fn load_normalizes_a_legacy_server_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.private.json");
+        let key = SavedKey::Server(SavedServerKey {
+            identity: ServerIdentity::generate(),
+            credential_secret: STANDARD.encode([9_u8; LEGACY_CREDENTIAL_SECRET_LEN]),
+            relay_id: "test".to_owned(),
+            fixed_relay: false,
+            gateway_port: 49_152,
+        });
+        save(path.to_str().unwrap(), &key, false).unwrap();
+
+        let SavedKey::Server(loaded) = load(path.to_str().unwrap()).unwrap() else {
+            panic!("expected a server key")
+        };
+        assert_eq!(
+            STANDARD.decode(loaded.credential_secret).unwrap().len(),
+            CREDENTIAL_SEED_LEN
+        );
     }
 }

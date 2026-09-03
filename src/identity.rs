@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const CREDENTIAL_SEED_LEN: usize = 16;
+pub(crate) const CREDENTIAL_SEED_LEN: usize = 16;
 const CREDENTIAL_KDF_SALT: &[u8] = b"etcat credential v2";
 const EASYTIER_CREDENTIAL_INFO: &[u8] = b"easytier x25519 private key";
 const GATEWAY_AUTHENTICATION_INFO: &[u8] = b"gateway hmac-sha256 key";
