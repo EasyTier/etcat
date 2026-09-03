@@ -26,8 +26,14 @@ fn invalid_connection_token_fails_before_network_startup() {
 }
 
 #[test]
-fn built_in_relay_registry_does_not_advertise_unverified_relays() {
-    etcat().arg("relays").assert().success().stdout("");
+fn built_in_relay_registry_lists_the_community_relay() {
+    etcat()
+        .arg("relays")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "community-1\tCommunity\tencrypted-unpinned",
+        ));
 }
 
 #[test]

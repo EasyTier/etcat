@@ -1,2 +1,11 @@
 version = 1
-relay = []
+
+[[relay]]
+id = "community-1"
+region = "Community"
+probe = "38.76.179.190:11010"
+priority = 100
+endpoints = [
+  "tcp://38.76.179.190:11010",
+  "udp://38.76.179.190:11010",
+]

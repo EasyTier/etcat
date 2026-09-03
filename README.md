@@ -171,9 +171,9 @@ server restarts.
 
 ## Shared relay registry
 
-The built-in list lives in [`relays.toml`](relays.toml). It is intentionally
-empty until a Secure Mode relay has been independently verified; etcat will not
-ship a legacy or merely TCP-reachable endpoint as a working default. Provide a
+The built-in list lives in [`relays.toml`](relays.toml). It currently contains a
+best-effort community relay that has passed an end-to-end etcat transfer test,
+but has no uptime guarantee or independently published public key. Override the
 registry with `--relay-file` or `ETCAT_RELAY_FILE`:
 
 ```toml

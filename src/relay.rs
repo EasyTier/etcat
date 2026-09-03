@@ -168,9 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_does_not_advertise_an_unverified_relay() {
+    fn built_in_registry_contains_the_community_relay() {
         let registry = RelayRegistry::load(None).unwrap();
-        assert!(registry.relays().is_empty());
+        let relay = registry.get("community-1").unwrap();
+
+        assert_eq!(relay.probe, "38.76.179.190:11010");
+        assert_eq!(
+            relay.endpoints,
+            [
+                "tcp://38.76.179.190:11010".parse().unwrap(),
+                "udp://38.76.179.190:11010".parse().unwrap(),
+            ]
+        );
+        assert!(relay.public_key.is_none());
     }
 
     #[tokio::test]
