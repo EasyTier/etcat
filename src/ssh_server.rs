@@ -24,7 +24,7 @@ pub async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
     let config = Arc::new(server::Config {
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
-        inactivity_timeout: Some(Duration::from_secs(24 * 60 * 60)),
+        inactivity_timeout: Some(Duration::from_hours(24)),
         keys: vec![host_key],
         ..Default::default()
     });

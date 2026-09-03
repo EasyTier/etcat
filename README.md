@@ -12,9 +12,46 @@ DNS, bind privileged ports, or require root/administrator privileges.
 
 > This project is experimental. Tokens and the CLI may change before 1.0.
 
+## Install
+
+Linux and macOS:
+
+```console
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/EasyTier/etcat/main/install.sh | sh
+```
+
+The Unix installer selects the native platform archive and installs `etcat` to
+`/usr/local/bin`, using `sudo` only when the directory is not writable. Linux
+downloads are statically linked musl binaries.
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/EasyTier/etcat/main/install.ps1 | iex
+```
+
+The Windows installer writes to `%LOCALAPPDATA%\Programs\etcat` and adds that
+directory to the user `PATH`. Both installers verify the release archive against
+the published `SHA256SUMS`. Set `ETCAT_VERSION` to install a specific release,
+or `ETCAT_INSTALL_DIR` to choose another destination:
+
+```console
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/EasyTier/etcat/main/install.sh | ETCAT_VERSION=v0.1.0 ETCAT_INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+```powershell
+$env:ETCAT_VERSION = "v0.1.0"
+$env:ETCAT_INSTALL_DIR = "C:\Tools\etcat"
+irm https://raw.githubusercontent.com/EasyTier/etcat/main/install.ps1 | iex
+```
+
+Release archives are also available from the
+[GitHub releases page](https://github.com/EasyTier/etcat/releases) for Linux
+x86-64/ARM64, macOS Intel/Apple Silicon, and Windows x64/ARM64.
+
 ## Build
 
-Rust 1.88 or newer is required. EasyTier is pinned to commit
+Rust 1.95 or newer is required. EasyTier is pinned to commit
 `164e2db6aecd13117d840821d5b889b51cb7c463`.
 
 ```console
