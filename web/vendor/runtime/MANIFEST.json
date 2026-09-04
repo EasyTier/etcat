@@ -1,0 +1,20 @@
+{
+  "source": "/data/project/EasyTier-cloudflare-wasi",
+  "revision": "f2342a23350a38353cea3a8822899d3e1cb7544f",
+  "syncedAt": "2026-09-04T16:22:26.682Z",
+  "files": {
+    "easytier-contrib/easytier-cloudflare-worker/browser/etcat-client.ts": "6c6babec13a5a0cdc99e0fb5ecaca03aacbdecce4b5a67f3c88118f928dabfc5",
+    "easytier-contrib/easytier-cloudflare-worker/browser/etcat-server.ts": "9edadbfde8e9bcac66ae7ba20997b472286888406534f3e73f1e4c0ae2cae1f2",
+    "easytier-contrib/easytier-cloudflare-worker/browser/etcat-relays.generated.ts": "c0bd5b8c71ddc2dee0360bf57a47d8b83a5b8c74b248b445dacd5fe63bd32631",
+    "easytier-contrib/easytier-cloudflare-worker/browser/host.ts": "807cab11e3b358944c5aa4194f6feac9bbddedc88c71a242163f836f973143ac",
+    "easytier-contrib/easytier-cloudflare-worker/browser/transfer.ts": "4f162696a24962ca3e4633bbc1b05032533bb498912f99ec9837e71d32216c42",
+    "easytier-contrib/easytier-cloudflare-worker/browser/lib.ts": "4a1eb0677ba1c95f34a286cb3ce2eeee721bb346b539493f8e6352726b9cb44a",
+    "easytier-contrib/easytier-cloudflare-worker/src/core-runtime.ts": "1cc6cfb02012b6020b2cbe4f27a066d4e866a73935f158b53da844b28287d02b",
+    "easytier-contrib/easytier-cloudflare-worker/src/data-plane.ts": "7d192e546c984aad98e4369151c18f4d2f946704628bb0039ddb7e45c4e1c389",
+    "easytier-contrib/easytier-cloudflare-worker/src/websocket-host.ts": "63628078d11966e5e2b5c8c920b5a1781619a4100895e81b227efbf745714831",
+    "easytier-contrib/easytier-cloudflare-worker/src/wasi-clock.ts": "ac2c71662b35d506cc8796980d008c3f7fd18ae034acdfeb2ff6c933ae89bdca",
+    "easytier-contrib/easytier-cloudflare-worker/src/wasi-preview1.ts": "0b2434388a272b415c53fcbadc606cfaa8917fc1a2667b396d60f776e1de52c0",
+    "easytier-contrib/easytier-cloudflare-worker/src/jspi.d.ts": "aac06acd9bd62ee4c0b1d7ab5ee9c8ca2ff4fbdf5ceb92844f8a08a25c1edaa9",
+    "easytier-contrib/easytier-cloudflare-worker/browser/generated/easytier_core.wasm": "ce8be5649c5ccde2de3dafefa491964fecff22dfea3d367e4b2e4b3ad3f65bc5"
+  }
+}

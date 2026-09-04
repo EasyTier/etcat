@@ -2,4 +2,6 @@
 /.idea/
 /.vscode/
 *.log
+/web/node_modules/
+/web/dist/
 

@@ -420,34 +420,69 @@ it does not read Tailcat tokens.
 
 ## Browser send and receive
 
-The EasyTier WebAssembly runtime also provides an etcat browser page and
-TypeScript client/server API under
-[`easytier-cloudflare-worker/browser`](https://github.com/EasyTier/EasyTier/tree/main/easytier-contrib/easytier-cloudflare-worker/browser).
-It implements Tailcat's browser send/receive workflow: create a receiver token,
-send text or a file to logical port 1, half-close the stream, and wait for the
-receiver to confirm EOF. Browser-created bearer tokens work with the native
-CLI:
+The `web/` directory contains the browser app: a Vue 3 + Vite single-page UI
+that sends and receives files or text through the EasyTier WebAssembly
+runtime. It implements Tailcat's browser send/receive workflow: create a
+receiver token, send text or a file to logical port 1, half-close the stream,
+and wait for the receiver to confirm EOF. Browser-created bearer tokens work
+with the native CLI:
 
 ```console
-browser$ Create listener, then copy etc2...
+browser$ Start receiving, then copy etc2...
 client$ etcat etc2... < archive.tar.zst
 ```
 
 Browser networking is relay-only. Its relay must publish a `ws://` or
-`wss://` EasyTier endpoint, and an HTTPS page can use only `wss://`. To send
-from the browser to a native receiver, use a relay registry containing such an
-endpoint and print a self-contained token:
+`wss://` EasyTier endpoint, and an HTTPS page can use only `wss://`. The
+checked-in community relay includes a publicly trusted WSS endpoint and is the
+app's zero-config default. To send from the browser to a native receiver,
+print a self-contained token and paste it into the app (or open the app's
+share link, which fills the token in automatically):
 
 ```console
-server$ etcat --relay-file=relays.toml --full-address --key=new
+server$ etcat --full-address --key=new
 browser$ Paste the printed token under Send
 ```
 
-The checked-in community relay includes a publicly trusted WSS endpoint, so the
-browser works with `community-1` without extra relay configuration. Browser
-listeners use ephemeral keys unless the user explicitly enables browser-local
-persistence. Sealed `--allow`/HPKE client tokens are not supported by the
-browser API yet; bearer tokens are supported.
+Browser listeners use ephemeral keys unless the user explicitly enables
+browser-local persistence under Advanced relay settings. Sealed
+`--allow`/HPKE client tokens are not supported by the browser API yet; bearer
+tokens are supported.
+
+### Build and serve the web app
+
+Node 22+ and pnpm are required. The vendored EasyTier runtime under
+`web/vendor/runtime/` and `web/public/easytier_core.wasm` is committed, so a
+plain build works without an EasyTier checkout:
+
+```console
+cd web
+pnpm install
+pnpm build
+python3 -m http.server 8000 --directory dist
+```
+
+To refresh the vendored runtime after upstream EasyTier changes, build the
+browser-profile Wasm in an EasyTier checkout
+(`easytier-contrib/easytier-cloudflare-worker`, `pnpm build:browser-wasm`) and
+re-sync:
+
+```console
+pnpm sync:runtime -- --from /path/to/EasyTier
+```
+
+The sync records the source revision and per-file SHA-256 in
+`web/vendor/runtime/MANIFEST.json`.
+
+### Browser smoke automation
+
+The page keeps the query-string hooks used by the EasyTier browser smoke
+harness: `?mode=listen` starts a listener on load, `?mode=send&token=etc2...
+&bytes=N` sends `N` random bytes, `?sink=hash` hashes received payloads instead
+of showing cards, and `?relay=` / `?relayKey=` override the relay settings.
+Progress is reported on `window.etcatTest`
+(`ready`/`listenToken`/`recvBytes`/`recvHash`/`recvDone`/`sentBytes`/
+`sentHash`/`sentDone`/`errors`).
 
 ## License
 
