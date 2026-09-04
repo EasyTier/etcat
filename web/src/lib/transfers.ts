@@ -407,7 +407,7 @@ function handleIncoming(
     } catch (error) {
       transfer.status = "failed";
       transfer.error = overflow
-        ? "Payload too large to receive in the browser"
+        ? "i18n:transfer.tooLarge"
         : recordError(error);
     } finally {
       await stream.close().catch(() => undefined);

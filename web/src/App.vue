@@ -31,9 +31,11 @@ const incomingTotal = computed(
   () => store.transfers.filter((transfer) => transfer.direction === "receive").length,
 );
 const unseenIncoming = computed(() =>
-  mode.value === "receive" ? 0 : Math.max(0, incomingTotal.value - seenIncoming.value),
+  Math.max(0, incomingTotal.value - seenIncoming.value),
 );
-watch(mode, (value) => {
+watch([mode, incomingTotal], ([value]) => {
+  // While Receive is active every arrival is seen immediately; on entering the
+  // tab the current total becomes the seen baseline.
   if (value === "receive") seenIncoming.value = incomingTotal.value;
 });
 

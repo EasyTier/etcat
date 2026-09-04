@@ -14,7 +14,6 @@ const file = ref<File | null>(null);
 const text = ref("");
 const dragging = ref(false);
 const sending = ref(false);
-const sendError = ref<string | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
 
 const outgoing = computed(() =>
@@ -28,7 +27,9 @@ const tokenInvalid = computed(() => {
   if (value.startsWith("etc2")) return false;
   try {
     const url = new URL(value);
-    return url.searchParams.get("token") === null;
+    const token = url.searchParams.get("token");
+    // A link is only valid if it actually carries an etc2 token.
+    return token === null || !token.startsWith("etc2");
   } catch {
     return true;
   }
@@ -62,7 +63,6 @@ function onDrop(event: DragEvent): void {
 }
 
 async function send(): Promise<void> {
-  sendError.value = null;
   sending.value = true;
   try {
     if (file.value !== null) {
@@ -80,8 +80,8 @@ async function send(): Promise<void> {
         return data.subarray(offset, offset + length);
       });
     }
-  } catch (error) {
-    sendError.value = error instanceof Error ? error.message : String(error);
+  } catch {
+    // The transfer card carries the failure; the panel stays quiet.
   } finally {
     sending.value = false;
   }
@@ -177,13 +177,6 @@ async function send(): Promise<void> {
       <SendHorizontal class="size-4" />
       {{ sending ? t("send.sending") : file !== null ? t("send.sendFile") : t("send.sendText") }}
     </button>
-
-    <div
-      v-if="sendError !== null"
-      class="rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
-    >
-      {{ sendError }}
-    </div>
 
     <div v-if="outgoing.length > 0" class="space-y-3">
       <TransferCard

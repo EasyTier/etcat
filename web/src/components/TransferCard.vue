@@ -75,6 +75,15 @@ const statusLabel = computed(() => {
   }
 });
 
+// Sentinel errors written by the transfer store carry an i18n key; everything
+// else is a raw message.
+const displayError = computed(() => {
+  const error = props.transfer.error;
+  if (error === null) return null;
+  if (error === "i18n:transfer.tooLarge") return t("transfer.tooLarge");
+  return error;
+});
+
 const copiedText = ref(false);
 async function copyReceivedText(): Promise<void> {
   if (props.transfer.receivedText === null) return;
@@ -90,6 +99,10 @@ async function save(): Promise<void> {
   saving.value = true;
   try {
     await saveReceivedFile(props.transfer.id, "etcat-download");
+  } catch (error) {
+    // Keep the payload, but surface the failure on the card.
+    props.transfer.error =
+      error instanceof Error ? error.message : String(error);
   } finally {
     saving.value = false;
   }
@@ -146,8 +159,8 @@ async function save(): Promise<void> {
       <div v-else class="progress-indeterminate h-full w-full rounded-full" />
     </div>
 
-    <div v-if="transfer.error !== null" class="mt-2 text-xs text-rose-400">
-      {{ transfer.error }}
+    <div v-if="displayError !== null" class="mt-2 text-xs text-rose-400">
+      {{ displayError }}
     </div>
 
     <div v-if="transfer.status === 'failed' && transfer.retry !== null" class="mt-3">
