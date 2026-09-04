@@ -221,6 +221,9 @@ user's home directory, and absolute paths retain their operating-system
 meaning. Supplying `--files` always restores the rooted restriction, even when
 shell access is also enabled.
 
+On Windows, pass an absolute drive path such as `C:\\incoming` to `--files`.
+Drive-relative forms such as `C:` and `C:incoming` are not accepted.
+
 ## SOCKS and process-scoped exit access
 
 Run a command with `all_proxy` pointing at a temporary local SOCKS5 listener:
@@ -408,6 +411,36 @@ The native CLI covers Tailcat's pipe, `serve`, `ping`, `socks`, `ssh`, `cp`,
 `ls`, `forward`, `recv`, `parse`, `resolve`, `genkey`, `printpub`, `version`, and
 `readme` workflows. etcat has its own `etc2` token and EasyTier relay protocol;
 it does not read Tailcat tokens.
+
+## Browser send and receive
+
+The EasyTier WebAssembly runtime also provides an etcat browser page and
+TypeScript client/server API under
+[`easytier-cloudflare-worker/browser`](https://github.com/EasyTier/EasyTier/tree/main/easytier-contrib/easytier-cloudflare-worker/browser).
+It implements Tailcat's browser send/receive workflow: create a receiver token,
+send text or a file to logical port 1, half-close the stream, and wait for the
+receiver to confirm EOF. Browser-created bearer tokens work with the native
+CLI:
+
+```console
+browser$ Create listener, then copy etc2...
+client$ etcat etc2... < archive.tar.zst
+```
+
+Browser networking is relay-only. Its relay must publish a `ws://` or
+`wss://` EasyTier endpoint, and an HTTPS page can use only `wss://`. To send
+from the browser to a native receiver, use a relay registry containing such an
+endpoint and print a self-contained token:
+
+```console
+server$ etcat --relay-file=relays.toml --full-address --key=new
+browser$ Paste the printed token under Send
+```
+
+The checked-in community relay currently has only TCP/UDP endpoints and cannot
+carry browser traffic. Browser listeners use ephemeral keys unless the user
+explicitly enables browser-local persistence. Sealed `--allow`/HPKE client
+tokens are not supported by the browser API yet; bearer tokens are supported.
 
 ## License
 
