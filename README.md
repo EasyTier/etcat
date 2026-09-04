@@ -99,6 +99,10 @@ client$ printf 'hello\n' | etcat etc2...
 
 The server writes `hello` to stdout and exits.
 
+While a one-shot raw stream is active, the server processes Ctrl-C after the
+peer closes that stream. Close the client side first when interrupting a hung
+raw transfer.
+
 ## Expose local TCP services
 
 The server can allow individual ports, ranges, or every local TCP port. The
