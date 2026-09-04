@@ -10,7 +10,7 @@ import {
 import ReceivePanel from "./components/ReceivePanel.vue";
 import SendPanel from "./components/SendPanel.vue";
 import { startListener, closeListenerOnPageHide, enqueueSend, pendingSend } from "@/lib/transfers";
-import { installTestHooks, queryAutomation, testState } from "@/lib/testhooks";
+import { installTestHooks, queryAutomation, recordError, testState } from "@/lib/testhooks";
 import { sha256Hex } from "@/lib/runtime";
 import { startWasmLoad, useWasm } from "@/lib/wasm";
 
@@ -81,7 +81,7 @@ onMounted(async () => {
       });
     }
   } catch (error) {
-    startupError.value = error instanceof Error ? error.message : String(error);
+    startupError.value = recordError(error);
   }
 });
 

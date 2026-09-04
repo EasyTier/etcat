@@ -143,6 +143,7 @@ export async function startListener(sinkHash: boolean): Promise<void> {
       ? loadPersistentServerKey(window.localStorage)
       : undefined;
     let relayReady = false;
+    let relayErrorReported = false;
     const nextServer = await etcatListen(requireWasmModule(), {
       relay: relay(),
       fullAddress: true,
@@ -161,7 +162,9 @@ export async function startListener(sinkHash: boolean): Promise<void> {
           if (store.listener.kind === "listening") {
             store.listener.relayReady = true;
           }
-        } else if (event.kind === "connect_error") {
+        } else if (event.kind === "connect_error" && !relayErrorReported) {
+          // The connector retries; report only the first failure.
+          relayErrorReported = true;
           recordError(new Error(`Relay connection failed: ${event.message}`));
         }
       },
@@ -191,6 +194,17 @@ export async function stopListener(): Promise<void> {
   server = undefined;
   store.listener = { kind: "idle" };
   await current?.close().catch(() => undefined);
+  // Settle incoming connections still waiting for a user choice; their
+  // streams are already closed with the server, so resolve the pending
+  // handler promises and fail their cards instead of leaking them.
+  const pending = Array.from(pendingIncoming.values());
+  pendingIncoming.clear();
+  for (const { stream, transfer, resolve } of pending) {
+    transfer.status = "failed";
+    transfer.error = "Listener stopped";
+    await stream.close().catch(() => undefined);
+    resolve();
+  }
 }
 
 export function closeListenerOnPageHide(): void {
@@ -205,21 +219,24 @@ export function enqueueSend(
   size: number,
   reader: (offset: number, length: number) => Promise<Uint8Array>,
 ): Promise<void> {
+  // Capture the token now: the queued payload must go to the receiver chosen
+  // at submit time, not to whatever the input holds when the queue drains.
+  const token = pendingSend.token.trim();
   // Serialize sends: one connection at a time keeps status readable and
   // avoids competing relay sessions.
-  const run = sendQueue.then(() => sendPayload(name, kind, size, reader));
+  const run = sendQueue.then(() => sendPayload(token, name, kind, size, reader));
   sendQueue = run.catch(() => undefined);
   return run;
 }
 
 async function sendPayload(
+  token: string,
   name: string | null,
   kind: "file" | "text",
   size: number,
   reader: (offset: number, length: number) => Promise<Uint8Array>,
 ): Promise<void> {
   const transfer = addTransfer({ direction: "send", kind, name, size });
-  const token = pendingSend.token.trim();
   if (token.length === 0) {
     transfer.status = "failed";
     transfer.error = recordError(new Error("Enter an etc2 receiver token first"));
@@ -364,35 +381,40 @@ export async function receiveAsFile(id: number, suggestedName: string): Promise<
   transfer.name = suggestedName;
   transfer.startedAt = Date.now();
 
-  try {
-    const picker = (
-      window as unknown as {
-        showSaveFilePicker?: (options: {
-          suggestedName: string;
-        }) => Promise<{
-          createWritable(): Promise<{
-            write(data: Uint8Array): Promise<void>;
-            close(): Promise<void>;
-            abort?(): Promise<void>;
-          }>;
+  const picker = (
+    window as unknown as {
+      showSaveFilePicker?: (options: {
+        suggestedName: string;
+      }) => Promise<{
+        createWritable(): Promise<{
+          write(data: Uint8Array): Promise<void>;
+          close(): Promise<void>;
+          abort?(): Promise<void>;
         }>;
-      }
-    ).showSaveFilePicker;
+      }>;
+    }
+  ).showSaveFilePicker;
 
-    if (picker !== undefined) {
-      let handle;
-      try {
-        handle = await picker({ suggestedName });
-      } catch (error) {
-        // A cancelled picker must not drop the payload: the stream is still
-        // open and unconsumed, so hand the choice back to the user.
-        if (error instanceof Error && error.name === "AbortError") {
-          transfer.status = "awaiting-choice";
-          pendingIncoming.set(id, { stream, transfer, resolve });
-          return;
-        }
-        throw error;
+  if (picker !== undefined) {
+    let handle;
+    try {
+      handle = await picker({ suggestedName });
+    } catch (error) {
+      // A cancelled picker must not drop the payload: the stream is still
+      // open and unconsumed, so hand the choice back to the user. Skip the
+      // close-and-settle path — the pending entry stays alive.
+      if (error instanceof Error && error.name === "AbortError") {
+        transfer.status = "awaiting-choice";
+        pendingIncoming.set(id, { stream, transfer, resolve });
+        return;
       }
+      transfer.status = "failed";
+      transfer.error = recordError(error);
+      await stream.close().catch(() => undefined);
+      resolve();
+      return;
+    }
+    try {
       const writable = await handle.createWritable();
       try {
         const total = await drainPayload(
@@ -408,21 +430,31 @@ export async function receiveAsFile(id: number, suggestedName: string): Promise<
         await writable.abort?.().catch(() => undefined);
         throw error;
       }
-    } else {
-      const chunks: Uint8Array[] = [];
-      const total = await drainPayload(
-        stream,
-        (chunk) => {
-          chunks.push(Uint8Array.from(chunk));
-        },
-        (bytes) => {
-          transfer.bytes = bytes;
-        },
-      );
-      const blob = new Blob(chunks as unknown as BlobPart[]);
-      transfer.downloadUrl = URL.createObjectURL(blob);
-      transfer.bytes = total;
+      transfer.status = "done";
+    } catch (error) {
+      transfer.status = "failed";
+      transfer.error = recordError(error);
+    } finally {
+      await stream.close().catch(() => undefined);
+      resolve();
     }
+    return;
+  }
+
+  try {
+    const chunks: Uint8Array[] = [];
+    const total = await drainPayload(
+      stream,
+      (chunk) => {
+        chunks.push(Uint8Array.from(chunk));
+      },
+      (bytes) => {
+        transfer.bytes = bytes;
+      },
+    );
+    const blob = new Blob(chunks as unknown as BlobPart[]);
+    transfer.downloadUrl = URL.createObjectURL(blob);
+    transfer.bytes = total;
     transfer.status = "done";
   } catch (error) {
     transfer.status = "failed";
