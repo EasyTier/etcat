@@ -204,6 +204,8 @@ mod tests {
             [
                 "tcp://38.76.179.190:11010".parse().unwrap(),
                 "udp://38.76.179.190:11010".parse().unwrap(),
+                "ws://38.76.179.190:11011".parse().unwrap(),
+                "wss://relay.38-76-179-190.sslip.io/".parse().unwrap(),
             ]
         );
         assert!(relay.public_key.is_none());

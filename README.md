@@ -335,8 +335,10 @@ server restarts.
 
 The built-in list lives in [`relays.toml`](relays.toml). It currently contains a
 best-effort community relay that has passed an end-to-end etcat transfer test,
-but has no uptime guarantee or independently published public key. Override the
-registry with `--relay-file` or `ETCAT_RELAY_FILE`:
+including through its browser-compatible WSS endpoint. It has no uptime
+guarantee or independently published EasyTier public key. TLS authenticates the
+WSS hostname, but EasyTier will still warn that the relay identity is not
+pinned. Override the registry with `--relay-file` or `ETCAT_RELAY_FILE`:
 
 ```toml
 version = 1
@@ -441,10 +443,11 @@ server$ etcat --relay-file=relays.toml --full-address --key=new
 browser$ Paste the printed token under Send
 ```
 
-The checked-in community relay currently has only TCP/UDP endpoints and cannot
-carry browser traffic. Browser listeners use ephemeral keys unless the user
-explicitly enables browser-local persistence. Sealed `--allow`/HPKE client
-tokens are not supported by the browser API yet; bearer tokens are supported.
+The checked-in community relay includes a publicly trusted WSS endpoint, so the
+browser works with `community-1` without extra relay configuration. Browser
+listeners use ephemeral keys unless the user explicitly enables browser-local
+persistence. Sealed `--allow`/HPKE client tokens are not supported by the
+browser API yet; bearer tokens are supported.
 
 ## License
 
