@@ -18,6 +18,8 @@ use russh_sftp::{
     server::{Handler, StatusReply},
 };
 
+const MAX_READ_SIZE: usize = 1024 * 1024;
+
 /// Access policy for a rooted file service.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FileMode {
@@ -670,7 +672,7 @@ impl Handler for FileSession {
                 return Err(FileServiceError::permission("file handle is not readable"));
             }
             file.seek(SeekFrom::Start(offset))?;
-            let mut data = vec![0; len as usize];
+            let mut data = vec![0; (len as usize).min(MAX_READ_SIZE)];
             let count = file.read(&mut data)?;
             if count == 0 {
                 return Err(FileServiceError::new(StatusCode::Eof, "end of file"));
@@ -1081,6 +1083,31 @@ mod tests {
             b"new"
         );
         read_write.remove(4, "renamed.txt".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn limits_each_read_response() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("large.bin"),
+            vec![7_u8; MAX_READ_SIZE + 1],
+        )
+        .unwrap();
+        let mut session = FileService::new(directory.path(), FileMode::ReadOnly)
+            .unwrap()
+            .session();
+        let opened = session
+            .open(
+                1,
+                "large.bin".into(),
+                OpenFlags::READ,
+                FileAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        let data = session.read(2, opened.handle, 0, u32::MAX).await.unwrap();
+        assert_eq!(data.data.len(), MAX_READ_SIZE);
     }
 
     #[tokio::test]

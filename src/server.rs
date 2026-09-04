@@ -8,7 +8,11 @@ use std::{
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use easytier::common::config::ManagedCredentialConfig;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
+};
 
 use crate::{
     crypto::{seal_credential, validate_public_key},
@@ -63,11 +67,8 @@ pub struct IncomingConnection {
 /// A reusable etcat server transport.
 pub struct Server {
     mesh: MeshInstance,
-    gateway: TcpListener,
-    network_name: String,
-    signing_key: ed25519_dalek::SigningKey,
-    authentication_keys: Vec<[u8; 32]>,
-    authentication_expiry: Option<i64>,
+    incoming: Mutex<mpsc::Receiver<Result<IncomingConnection>>>,
+    accept_task: Mutex<Option<JoinHandle<()>>>,
     token: ConnectionToken,
     relay: Relay,
 }
@@ -127,13 +128,19 @@ impl Server {
             options.full_address,
             expires_unix,
         )?;
+        let (incoming_tx, incoming_rx) = mpsc::channel(256);
+        let accept_task = tokio::spawn(accept_gateway_connections(
+            gateway,
+            identity.network_name.clone(),
+            identity.signing_key()?,
+            authentication_keys,
+            expires_unix,
+            incoming_tx,
+        ));
         Ok(Self {
             mesh,
-            gateway,
-            network_name: identity.network_name.clone(),
-            signing_key: identity.signing_key()?,
-            authentication_keys,
-            authentication_expiry: expires_unix,
+            incoming: Mutex::new(incoming_rx),
+            accept_task: Mutex::new(Some(accept_task)),
             token,
             relay,
         })
@@ -148,24 +155,88 @@ impl Server {
     }
 
     pub async fn accept(&self) -> Result<IncomingConnection> {
-        let (mut stream, _) = self.gateway.accept().await?;
-        let (destination, ()) = server_handshake(
-            &mut stream,
-            &self.network_name,
-            &self.signing_key,
-            &self.authentication_keys,
-            self.authentication_expiry,
-            |_| async { Ok(()) },
-        )
-        .await?;
-        Ok(IncomingConnection {
-            destination,
-            stream,
-        })
+        self.incoming
+            .lock()
+            .await
+            .recv()
+            .await
+            .context("etcat server has stopped accepting connections")?
     }
 
     pub async fn stop(&self) {
+        if let Some(task) = self.accept_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
         self.mesh.stop().await;
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(task) = self.accept_task.get_mut().take() {
+            task.abort();
+        }
+    }
+}
+
+async fn accept_gateway_connections(
+    gateway: TcpListener,
+    network_name: String,
+    signing_key: ed25519_dalek::SigningKey,
+    authentication_keys: Vec<[u8; 32]>,
+    authentication_expiry: Option<i64>,
+    incoming: mpsc::Sender<Result<IncomingConnection>>,
+) {
+    let signing_key = std::sync::Arc::new(signing_key);
+    let authentication_keys = std::sync::Arc::new(authentication_keys);
+    let slots = std::sync::Arc::new(Semaphore::new(256));
+    let mut handshakes = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = gateway.accept() => {
+                let (mut stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        let _ = incoming.send(Err(error.into())).await;
+                        break;
+                    }
+                };
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    tracing::warn!("server authentication connection limit reached");
+                    continue;
+                };
+                let network_name = network_name.clone();
+                let signing_key = signing_key.clone();
+                let authentication_keys = authentication_keys.clone();
+                let incoming = incoming.clone();
+                handshakes.spawn(async move {
+                    let _slot = slot;
+                    match server_handshake(
+                        &mut stream,
+                        &network_name,
+                        signing_key.as_ref(),
+                        authentication_keys.as_ref(),
+                        authentication_expiry,
+                        |_| async { Ok(()) },
+                    )
+                    .await
+                    {
+                        Ok((destination, ())) => {
+                            let _ = incoming
+                                .send(Ok(IncomingConnection { destination, stream }))
+                                .await;
+                        }
+                        Err(error) => tracing::debug!(?error, "gateway connection closed"),
+                    }
+                });
+            }
+            result = handshakes.join_next(), if !handshakes.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::debug!(?error, "gateway authentication task failed");
+                }
+            }
+        }
     }
 }
 
@@ -358,6 +429,7 @@ mod tests {
     use std::net::TcpListener as StdTcpListener;
 
     use super::*;
+    use crate::{identity::server_fingerprint, protocol::client_handshake};
 
     #[test]
     fn library_server_options_are_constructible() {
@@ -372,5 +444,51 @@ mod tests {
     fn gateway_port_reservation_uses_loopback() {
         let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         assert!(listener.local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn slow_handshake_does_not_block_an_authenticated_connection() {
+        let gateway = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = gateway.local_addr().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let fingerprint = server_fingerprint(&signing_key.verifying_key().to_bytes());
+        let authentication_key = [7_u8; 32];
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(1);
+        let accept_task = tokio::spawn(accept_gateway_connections(
+            gateway,
+            "etcat-test".to_owned(),
+            signing_key,
+            vec![authentication_key],
+            None,
+            incoming_tx,
+        ));
+
+        let stalled = TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut valid = TcpStream::connect(address).await.unwrap();
+        client_handshake(
+            &mut valid,
+            "etcat-test",
+            Destination::ServerPort { port: 8080 },
+            &fingerprint,
+            &authentication_key,
+        )
+        .await
+        .unwrap();
+
+        let incoming = tokio::time::timeout(Duration::from_secs(1), incoming_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            incoming.destination,
+            Destination::ServerPort { port: 8080 }
+        );
+
+        drop(stalled);
+        accept_task.abort();
+        let _ = accept_task.await;
+        assert!(TcpStream::connect(address).await.is_err());
     }
 }

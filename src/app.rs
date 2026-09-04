@@ -440,9 +440,11 @@ fn configured_file_service(
 }
 
 fn parse_file_spec(value: &str) -> Result<(PathBuf, crate::file_service::FileMode)> {
-    let split = value
-        .rsplit_once(':')
-        .filter(|(path, _)| !(path.len() == 1 && path.as_bytes()[0].is_ascii_alphabetic()));
+    let split = value.rsplit_once(':').filter(|(path, suffix)| {
+        !(path.len() == 1
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && (suffix.starts_with('/') || suffix.starts_with('\\')))
+    });
     let (path, mode) = match split {
         Some((path, mode)) => (
             path,
@@ -943,20 +945,20 @@ async fn run_forward(args: &crate::cli::ForwardArgs, cli: &Cli) -> Result<()> {
 }
 
 async fn run_recv(args: &crate::cli::RecvArgs, cli: &Cli) -> Result<()> {
+    run_server(cli, recv_server_options(args, cli)).await
+}
+
+fn recv_server_options(args: &crate::cli::RecvArgs, cli: &Cli) -> ServerOptions {
     let mode = if args.accept_dirs { "wo+" } else { "wo" };
     let files = format!("{}:{mode}", args.directory.display());
-    run_server(
-        cli,
-        ServerOptions {
-            services: vec!["files".to_owned()],
-            allow: Vec::new(),
-            full_address: false,
-            json: cli.json,
-            ttl: None,
-            files: Some(files),
-        },
-    )
-    .await
+    ServerOptions {
+        services: vec!["files".to_owned()],
+        allow: cli.allow.clone(),
+        full_address: cli.full_address,
+        json: cli.json,
+        ttl: cli.ttl.clone(),
+        files: Some(files),
+    }
 }
 
 fn run_cp(args: &crate::cli::CpArgs, cli: &Cli) -> Result<()> {
@@ -1263,7 +1265,11 @@ fn validate_dns_target(value: &str) -> Result<()> {
         "argument is neither an etc2 connection token nor a DNS name"
     );
     anyhow::ensure!(
-        !value.trim_end_matches('.').split('.').any(has_token_prefix),
+        !value.trim_end_matches('.').split('.').any(|label| {
+            label
+                .get(..crate::token::TOKEN_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(crate::token::TOKEN_PREFIX))
+        }),
         "refusing DNS lookup because the name contains an etc2 connection token"
     );
     anyhow::ensure!(
@@ -1330,6 +1336,7 @@ mod tests {
         assert!(validate_dns_target("alias.example.com.").is_ok());
         assert!(validate_dns_target("prefix.etc2secret.part.example.com").is_err());
         assert!(validate_dns_target("prefix.etc2secret.part.example.com.").is_err());
+        assert!(validate_dns_target("prefix.ETC2SECRET.part.example.com").is_err());
     }
 
     #[test]
@@ -1369,7 +1376,33 @@ mod tests {
                 crate::file_service::FileMode::ReadOnly
             )
         );
+        assert_eq!(
+            parse_file_spec("a:rw").unwrap(),
+            (PathBuf::from("a"), crate::file_service::FileMode::ReadWrite)
+        );
         assert!(parse_file_spec("/srv/public:invalid").is_err());
+    }
+
+    #[test]
+    fn recv_preserves_root_security_options() {
+        let cli = Cli::try_parse_from([
+            "etcat",
+            "--allow=etcp1client",
+            "--full-address",
+            "--ttl=15m",
+            "recv",
+            "--accept-dirs",
+            "incoming",
+        ])
+        .unwrap();
+        let Some(Command::Recv(args)) = cli.command.as_ref() else {
+            panic!("expected recv command")
+        };
+        let options = recv_server_options(args, &cli);
+        assert_eq!(options.allow, ["etcp1client"]);
+        assert!(options.full_address);
+        assert_eq!(options.ttl.as_deref(), Some("15m"));
+        assert_eq!(options.files.as_deref(), Some("incoming:wo+"));
     }
 
     #[test]
