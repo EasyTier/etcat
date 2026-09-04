@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    fs,
     io::{Read as _, Write as _},
+    path::PathBuf,
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -9,8 +11,8 @@ use std::{
 use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use russh::{
-    Channel, ChannelId,
-    keys::{Algorithm, PrivateKey},
+    Channel, ChannelId, Sig,
+    keys::{Algorithm, PrivateKey, load_secret_key, ssh_key::LineEnding},
     server::{self, Auth, ChannelOpenHandle, Msg, Session},
 };
 use tokio::{
@@ -18,9 +20,29 @@ use tokio::{
     process::{ChildStdin, Command},
 };
 
-pub async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
-    let host_key = PrivateKey::random(&mut rand10::rng(), Algorithm::Ed25519)
-        .context("failed to generate ephemeral SSH host key")?;
+pub async fn serve(
+    stream: tokio::net::TcpStream,
+    shell_enabled: bool,
+    file_service: Option<crate::file_service::FileService>,
+) -> Result<()> {
+    let host_key = load_or_create_host_key()?;
+    serve_with_host_key(stream, shell_enabled, file_service, host_key).await
+}
+
+async fn serve_with_host_key(
+    stream: tokio::net::TcpStream,
+    shell_enabled: bool,
+    file_service: Option<crate::file_service::FileService>,
+    host_key: PrivateKey,
+) -> Result<()> {
+    let file_service = match file_service {
+        Some(service) => Some(SftpService::Rooted(service)),
+        None if shell_enabled => Some(SftpService::Full(
+            crate::full_file_service::FullFileService::new()
+                .context("failed to start unrestricted SSH file service")?,
+        )),
+        None => None,
+    };
     let config = Arc::new(server::Config {
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
@@ -32,7 +54,11 @@ pub async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
         config,
         stream,
         ShellHandler {
+            shell_enabled,
+            file_service,
+            channels: HashMap::new(),
             inputs: HashMap::new(),
+            environments: HashMap::new(),
             pty_sizes: HashMap::new(),
             pty_masters: HashMap::new(),
             killers: HashMap::new(),
@@ -45,11 +71,21 @@ pub async fn serve(stream: tokio::net::TcpStream) -> Result<()> {
 }
 
 struct ShellHandler {
+    shell_enabled: bool,
+    file_service: Option<SftpService>,
+    channels: HashMap<ChannelId, Channel<Msg>>,
     inputs: HashMap<ChannelId, ProcessInput>,
+    environments: HashMap<ChannelId, HashMap<String, String>>,
     pty_sizes: HashMap<ChannelId, PtySize>,
     pty_masters: HashMap<ChannelId, Box<dyn MasterPty>>,
     killers: HashMap<ChannelId, Box<dyn ChildKiller + Send + Sync>>,
     tasks: HashMap<ChannelId, tokio::task::AbortHandle>,
+}
+
+#[derive(Clone, Debug)]
+enum SftpService {
+    Rooted(crate::file_service::FileService),
+    Full(crate::full_file_service::FullFileService),
 }
 
 enum ProcessInput {
@@ -68,12 +104,11 @@ impl ShellHandler {
             return self.start_pty_process(channel, command, size, session);
         }
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let shell = default_shell();
         let mut process = Command::new(shell);
-        if let Some(command) = command {
-            process.args(["-c", command]);
-        } else {
-            process.arg("-i");
+        configure_shell_command(&mut process, command);
+        if let Some(environment) = self.environments.get(&channel) {
+            process.envs(environment);
         }
         let mut child = process
             .stdin(Stdio::piped())
@@ -118,12 +153,13 @@ impl ShellHandler {
         let pair = native_pty_system()
             .openpty(size)
             .context("failed to allocate a pseudo-terminal")?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let shell = default_shell();
         let mut process = CommandBuilder::new(shell);
-        if let Some(command) = command {
-            process.args(["-c", command]);
-        } else {
-            process.arg("-i");
+        configure_pty_shell_command(&mut process, command);
+        if let Some(environment) = self.environments.get(&channel) {
+            for (name, value) in environment {
+                process.env(name, value);
+            }
         }
         let mut child = pair
             .slave
@@ -186,10 +222,11 @@ impl server::Handler for ShellHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<()> {
+        self.channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
     }
@@ -197,7 +234,7 @@ impl server::Handler for ShellHandler {
     async fn pty_request(
         &mut self,
         channel: ChannelId,
-        _term: &str,
+        term: &str,
         col_width: u32,
         row_height: u32,
         pix_width: u32,
@@ -205,11 +242,42 @@ impl server::Handler for ShellHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<()> {
+        if !self.shell_enabled {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         self.pty_sizes.insert(
             channel,
             pty_size(col_width, row_height, pix_width, pix_height),
         );
+        self.environments
+            .entry(channel)
+            .or_default()
+            .insert("TERM".to_owned(), term.to_owned());
         session.channel_success(channel)?;
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        session: &mut Session,
+    ) -> Result<()> {
+        if !self.shell_enabled {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        if matches!(variable_name, "TERM" | "LANG") || variable_name.starts_with("LC_") {
+            self.environments
+                .entry(channel)
+                .or_default()
+                .insert(variable_name.to_owned(), variable_value.to_owned());
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
         Ok(())
     }
 
@@ -232,6 +300,10 @@ impl server::Handler for ShellHandler {
     }
 
     async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
+        if !self.shell_enabled {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         self.start_process(channel, None, session)
     }
 
@@ -241,8 +313,43 @@ impl server::Handler for ShellHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<()> {
+        if !self.shell_enabled {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         let command = std::str::from_utf8(data).context("SSH command is not UTF-8")?;
         self.start_process(channel, Some(command), session)
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<()> {
+        let Some(file_service) = self.file_service.clone().filter(|_| name == "sftp") else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        let channel_stream = self
+            .channels
+            .remove(&channel)
+            .context("SFTP channel is unavailable")?
+            .into_stream();
+        session.channel_success(channel)?;
+        match file_service {
+            SftpService::Rooted(service) => {
+                tokio::spawn(async move {
+                    russh_sftp::server::run(channel_stream, service.session()).await;
+                });
+            }
+            SftpService::Full(service) => {
+                tokio::spawn(async move {
+                    russh_sftp::server::run(channel_stream, service.session()).await;
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn data(
@@ -269,10 +376,30 @@ impl server::Handler for ShellHandler {
         Ok(())
     }
 
+    async fn signal(
+        &mut self,
+        channel: ChannelId,
+        signal: Sig,
+        _session: &mut Session,
+    ) -> Result<()> {
+        if matches!(signal, Sig::INT)
+            && let Some(ProcessInput::Pty(input)) = self.inputs.get(&channel)
+        {
+            let _ = input.send(vec![3]);
+        } else if matches!(signal, Sig::KILL | Sig::TERM)
+            && let Some(killer) = self.killers.get_mut(&channel)
+        {
+            let _ = killer.kill();
+        }
+        Ok(())
+    }
+
     async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<()> {
         self.inputs.remove(&channel);
+        self.channels.remove(&channel);
         self.pty_masters.remove(&channel);
         self.pty_sizes.remove(&channel);
+        self.environments.remove(&channel);
         if let Some(mut killer) = self.killers.remove(&channel) {
             let _ = killer.kill();
         }
@@ -281,6 +408,93 @@ impl server::Handler for ShellHandler {
         }
         Ok(())
     }
+}
+
+fn default_shell() -> String {
+    #[cfg(unix)]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())
+    }
+    #[cfg(windows)]
+    {
+        "powershell.exe".to_owned()
+    }
+}
+
+fn configure_shell_command(command: &mut Command, requested: Option<&str>) {
+    #[cfg(unix)]
+    if let Some(requested) = requested {
+        command.args(["-c", requested]);
+    } else {
+        command.arg("-i");
+    }
+
+    #[cfg(windows)]
+    if let Some(requested) = requested {
+        command.args(["-NoLogo", "-NoProfile", "-Command", requested]);
+    } else {
+        command.arg("-NoLogo");
+    }
+}
+
+fn configure_pty_shell_command(command: &mut CommandBuilder, requested: Option<&str>) {
+    #[cfg(unix)]
+    if let Some(requested) = requested {
+        command.args(["-c", requested]);
+    } else {
+        command.arg("-i");
+    }
+
+    #[cfg(windows)]
+    if let Some(requested) = requested {
+        command.args(["-NoLogo", "-NoProfile", "-Command", requested]);
+    } else {
+        command.arg("-NoLogo");
+    }
+}
+
+fn load_or_create_host_key() -> Result<PrivateKey> {
+    let path = ssh_host_key_path()?;
+    if path.exists() {
+        return load_secret_key(&path, None)
+            .with_context(|| format!("failed to load SSH host key {}", path.display()));
+    }
+    let parent = path.parent().context("SSH host key path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let key = PrivateKey::random(&mut rand10::rng(), Algorithm::Ed25519)
+        .context("failed to generate SSH host key")?;
+    let encoded = key
+        .to_openssh(LineEnding::LF)
+        .context("failed to encode SSH host key")?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_secret_key(&path, None)
+                .with_context(|| format!("failed to load SSH host key {}", path.display()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to create SSH host key {}", path.display()))
+        }
+    }
+}
+
+fn ssh_host_key_path() -> Result<PathBuf> {
+    let key_dir = crate::key::key_dir()?;
+    Ok(key_dir
+        .parent()
+        .context("key directory has no parent")?
+        .join("ssh_host_ed25519"))
 }
 
 fn pty_size(col_width: u32, row_height: u32, pix_width: u32, pix_height: u32) -> PtySize {
@@ -315,5 +529,40 @@ async fn pump_output(
         if result.is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn files_only_server_runs_the_sftp_subsystem() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("visible.txt"), "visible").unwrap();
+        let service = crate::file_service::FileService::new(
+            directory.path(),
+            crate::file_service::FileMode::ReadOnly,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let key = PrivateKey::random(&mut rand10::rng(), Algorithm::Ed25519).unwrap();
+            serve_with_host_key(stream, false, Some(service), key).await
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let client = crate::file_client::FileClient::connect(stream)
+            .await
+            .unwrap();
+        client.list(".", false).await.unwrap();
+        client.close().await.unwrap();
+        server.await.unwrap().unwrap();
     }
 }

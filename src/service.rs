@@ -3,11 +3,13 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ServePolicy {
     ports: BTreeSet<u16>,
     pub all_ports: bool,
     pub no_auth_ssh: bool,
     pub exit_node: bool,
+    pub files: bool,
 }
 
 impl ServePolicy {
@@ -17,6 +19,7 @@ impl ServePolicy {
             all_ports: false,
             no_auth_ssh: false,
             exit_node: false,
+            files: false,
         };
         for value in values {
             let value = value.trim();
@@ -25,6 +28,7 @@ impl ServePolicy {
                 "all" => policy.all_ports = true,
                 "no-auth-ssh" => policy.no_auth_ssh = true,
                 "exit-node" => policy.exit_node = true,
+                "files" => policy.files = true,
                 _ => {
                     if let Some((first, last)) = value.split_once('-') {
                         let first = parse_port(first)?;
@@ -74,6 +78,7 @@ mod tests {
         assert!(!policy.allows(82));
         assert!(policy.no_auth_ssh);
         assert!(!policy.exit_node);
+        assert!(!policy.files);
     }
 
     #[test]

@@ -56,6 +56,33 @@ fn readme_flag_prints_embedded_documentation() {
 }
 
 #[test]
+fn readme_and_version_subcommands_are_available() {
+    etcat()
+        .arg("readme")
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("# etcat"));
+    etcat()
+        .arg("version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn printpub_uses_a_temporary_identity_when_no_default_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    etcat()
+        .arg("printpub")
+        .env("XDG_CONFIG_HOME", directory.path())
+        .env("APPDATA", directory.path())
+        .env("HOME", directory.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("etcp1"));
+}
+
+#[test]
 fn serve_rejects_positional_client_arguments() {
     etcat()
         .args(["--serve=8080", "etc2invalid"])
@@ -122,6 +149,17 @@ fn genkey_delete_requires_an_explicit_key_name() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "genkey --delete requires --key=<name>",
+            "genkey requires --key=<name|path>",
+        ));
+}
+
+#[test]
+fn genkey_generation_requires_an_explicit_key() {
+    etcat()
+        .arg("genkey")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "genkey requires --key=<name|path>",
         ));
 }

@@ -60,8 +60,26 @@ cargo build --release
 ./target/release/etcat --readme
 ```
 
-Linux, macOS, and Windows are supported. The built-in no-auth SSH server is
-available on Unix; forwarding to an existing SSH server works everywhere.
+Linux, macOS, and Windows are supported, including the built-in SSH and SFTP
+server.
+
+## Command overview
+
+Run `etcat COMMAND --help` for every option. The main workflows are:
+
+| Goal | Server | Client |
+| --- | --- | --- |
+| One-shot pipe | `etcat --key=new` | `etcat TOKEN` |
+| Serve TCP ports | `etcat serve 22,8080,9000-9010` | `etcat TOKEN 8080` |
+| Forward listeners | `etcat serve 8080` | `etcat forward TOKEN 18080:8080` |
+| Temporary SSH | `etcat serve no-auth-ssh` | `etcat ssh TOKEN` |
+| Existing SSH daemon | `etcat serve 22` | `etcat ssh TOKEN` |
+| Read-only files | `etcat serve files --files=DIR:ro` | `etcat ls TOKEN:.` |
+| Receive files | `etcat recv DIR` | `etcat cp FILE TOKEN:` |
+| SOCKS for a command | `etcat serve exit-node` | `etcat socks TOKEN curl https://example.com` |
+
+`TOKEN` means the `etc2...` address printed by the server. A DNS name with an
+`etcat=etc2...` TXT record can be used in the same places.
 
 ## Pipe stdin to another machine
 
@@ -83,11 +101,13 @@ The server writes `hello` to stdout and exits.
 
 ## Expose local TCP services
 
-The server can allow individual ports, ranges, or every local TCP port:
+The server can allow individual ports, ranges, or every local TCP port. The
+root `--serve` form and the `serve` command are equivalent:
 
 ```console
 server$ etcat --serve=22,8080,9000-9010
-server$ etcat --serve=all
+server$ etcat serve 22,8080 9000-9010
+server$ etcat serve all
 client$ etcat etc2... 8080
 ```
 
@@ -95,13 +115,38 @@ All destinations are connected on the server as `127.0.0.1:<port>`. EasyTier
 ACLs expose only etcat's random internal gateway port; the signed application
 handshake enforces the published service policy before opening a local socket.
 
-## SSH
+## Local forwarding
 
-On Linux and macOS, start an ephemeral SSH server that accepts any user without
-an SSH password or key:
+`forward` keeps one or more local listeners open and sends each connection to
+the selected server destination:
 
 ```console
-server$ etcat --serve=no-auth-ssh
+server$ etcat serve 8080,9000-9010
+client$ etcat forward etc2... 8080
+client$ etcat forward etc2... 18080:8080 19000:9000
+client$ etcat forward --bind=0.0.0.0 etc2... 0:8080
+```
+
+Mappings have these forms:
+
+| Mapping | Meaning |
+| --- | --- |
+| `8080` | Listen on 8080 and connect to server port 8080 |
+| `18080:8080` | Listen on 18080 and connect to server port 8080 |
+| `0:8080` | Pick a free local port and print it |
+| `13306:192.0.2.10:3306` | Through `exit-node`, connect to that IPv4 address |
+| `13306:[2001:db8::10]:3306` | Same for IPv6 |
+
+The default bind address is `127.0.0.1`. Exit-node mappings require the server
+to run `etcat serve exit-node`.
+
+## SSH
+
+Start an ephemeral SSH server that accepts any user without an SSH password or
+key:
+
+```console
+server$ etcat serve no-auth-ssh
 client$ etcat ssh etc2...
 client$ etcat ssh etc2... uname -a
 ```
@@ -110,19 +155,78 @@ Interactive sessions use a real PTY. The system OpenSSH client is launched with
 a ProxyCommand. Its host-key database is disabled because the etcat gateway
 handshake authenticates the server public key carried in the token.
 
+`ssh` defaults to logical server port 22. `-p` accepts another server port, or
+an IP/IP:port when the server has `exit-node` enabled:
+
+```console
+client$ etcat ssh -p 2222 etc2...
+client$ etcat ssh -p 192.0.2.10 etc2...
+client$ etcat ssh -p 192.0.2.10:2222 etc2...
+```
+
 To retain normal SSH authentication, expose the system SSH daemon instead:
 
 ```console
-server$ etcat --serve=22
-client$ etcat ssh -p 22 etc2...
+server$ etcat serve 22
+client$ etcat ssh user@etc2...
 ```
+
+The `ssh` command uses the system OpenSSH client. It preserves the child's exit
+status, supports interactive PTYs and resize events, and passes `TERM`, `LANG`,
+and `LC_*`. The built-in server uses one persistent SSH host key, while the
+etcat gateway handshake authenticates the endpoint identified by the token.
+
+## Files, `ls`, `cp`, and `recv`
+
+The `files` service is rooted at one directory. Paths visible to a client
+cannot escape that root, including through `..`, absolute paths, or symbolic
+links.
+
+```console
+server$ etcat serve files --files=/srv/releases:ro
+client$ etcat ls etc2...
+client$ etcat ls -l etc2...:subdirectory
+client$ etcat cp etc2...:artifact.tar.zst .
+```
+
+Available modes are:
+
+| Mode | Access |
+| --- | --- |
+| `ro` | List, inspect, and download |
+| `rw` | Full access inside the configured root |
+| `wo` | Flat write-only drop box; uploaded names cannot overwrite files |
+| `wo+` | Recursive write-only drop box; directory uploads are allowed |
+
+`--files=DIR` defaults to `ro`. `etcat serve files` defaults to the current
+directory in `ro` mode.
+
+For receiving uploads, `recv` is the shorter and safer spelling:
+
+```console
+server$ etcat recv ./incoming
+client$ etcat cp report.pdf etc2...:
+
+server$ etcat recv --accept-dirs ./incoming
+client$ etcat cp -r result-directory etc2...:
+```
+
+`cp` delegates transport behavior to the system OpenSSH `scp` client and
+supports `-r`, `-p`, and `-P PORT|IP|IP:PORT`. It accepts the usual local path
+and `TOKEN:PATH` operands and returns the exact `scp` exit status.
+
+When `no-auth-ssh` is enabled without an explicit `--files`, SFTP follows the
+current user's normal filesystem permissions: relative paths begin at that
+user's home directory, and absolute paths retain their operating-system
+meaning. Supplying `--files` always restores the rooted restriction, even when
+shell access is also enabled.
 
 ## SOCKS and process-scoped exit access
 
 Run a command with `all_proxy` pointing at a temporary local SOCKS5 listener:
 
 ```console
-server$ etcat --serve=8080
+server$ etcat serve 8080
 client$ etcat socks curl http://etc2...:8080/
 client$ etcat socks etc2... curl http://server.etcat:8080/
 ```
@@ -134,8 +238,15 @@ To reach arbitrary TCP destinations visible from the server, explicitly enable
 exit-node mode:
 
 ```console
-server$ etcat --serve=exit-node
+server$ etcat serve exit-node
 client$ etcat socks etc2... curl https://example.com/
+```
+
+Without a child command, `socks` keeps the local proxy running. Choose the
+listener with `--listen=PORT`, `--listen=IP`, or `--listen=IP:PORT`:
+
+```console
+client$ etcat socks --listen=127.0.0.1:1080 etc2...
 ```
 
 This affects only the child command or the explicitly printed local SOCKS
@@ -152,9 +263,9 @@ etcat resolve etc2...
 etcat relays
 ```
 
-`ping` reports whether EasyTier currently uses a direct peer path or the shared
-relay. A DNS name is accepted anywhere a token is accepted when its TXT records
-contain:
+`ping` performs an authenticated application handshake and reports whether
+EasyTier currently uses a direct peer path or the shared relay. A DNS name is
+accepted anywhere a token is accepted when its TXT records contain:
 
 ```text
 etcat=etc2...
@@ -174,9 +285,9 @@ The safe server default is a new in-memory identity and credential. Create a
 persistent server identity only when a stable token is required:
 
 ```console
-server$ etcat genkey
-server$ etcat genkey --fixed-relay
-server$ etcat genkey --relay=official-global
+server$ etcat genkey --key=default
+server$ etcat genkey --key=home --fixed-relay
+server$ etcat genkey --key=office --relay=community-1
 server$ etcat genkey --list
 server$ etcat genkey --delete --key=default
 ```
@@ -191,7 +302,7 @@ that only named clients can open, generate a client key and give its public key
 to the server:
 
 ```console
-client$ etcat genkey --client
+client$ etcat genkey --client --key=client-default
 # prints the public key and saves client-default
 
 server$ etcat --serve=22 --allow='<client public key>'
@@ -202,6 +313,11 @@ EasyTier credential sealed with HPKE. Clients automatically use
 `client-default`, or a named identity selected with `--key`. Key files and
 `ETCAT_ADDR_FILE` token files are written with mode `0600` on Unix.
 `--allow=none` starts a server that issues no usable client credential.
+
+Key generation and deletion deliberately require an explicit `--key`; there is
+no implicit file creation. `etcat printpub` prints `client-default` when it
+exists and otherwise prints a temporary public key. Use
+`etcat --key=new printpub` to force a temporary key.
 
 `--ttl=30m` adds an absolute credential expiry. Without `--ttl`, an ephemeral
 token is process-bound because its credential exists only in the running
@@ -257,16 +373,41 @@ unpinned and etcat prints a warning.
 - No-availability guarantee is implied for community shared relays. A private,
   pinned EasyTier relay is recommended for durable use.
 
-## Tailcat CLI compatibility
+## Rust library
 
-Tailcat's user-facing workflows work with `tailcat` replaced by `etcat`,
-including pipe, served ports, ping, SOCKS, SSH, parse, resolve, key management,
-`--readme`, `--allow=none`, and the common genkey flag aliases. EasyTier-specific
-relay configuration remains `--relay-file`, `--relay`, and `--fixed-relay`.
-The native names are `etc2...`, `server.etcat`, `ETCAT_ADDR_FILE`, and
-`etcat=etc2...` DNS TXT records; the corresponding Tailcat environment,
-hostname, and TXT labels are accepted as compatibility aliases where they are
-unambiguous.
+The package also exposes the transport as a Rust library. `Client` keeps one
+EasyTier session alive for repeated dials; `Server` accepts authenticated
+streams and reports the requested logical destination:
+
+```rust,no_run
+use etcat::{Client, ClientOptions, ConnectionToken, Destination, Server,
+    ServerOptions};
+
+# async fn example(encoded: &str) -> anyhow::Result<()> {
+let token = ConnectionToken::decode(encoded)?;
+let client = Client::connect(token, &ClientOptions::default()).await?;
+let stream = client.dial_port(8080).await?;
+
+let server = Server::bind(&ServerOptions::default()).await?;
+println!("{}", server.token().encode()?);
+let incoming = server.accept().await?;
+if let Destination::ServerPort { port } = incoming.destination {
+    println!("client requested port {port}");
+}
+# drop(stream);
+# Ok(())
+# }
+```
+
+The public file-service types are `FileService`, `FileMode`, and `FileSession`.
+Use them when embedding the rooted SFTP policy in another SSH server.
+
+## Tailcat workflow coverage
+
+The native CLI covers Tailcat's pipe, `serve`, `ping`, `socks`, `ssh`, `cp`,
+`ls`, `forward`, `recv`, `parse`, `resolve`, `genkey`, `printpub`, `version`, and
+`readme` workflows. etcat has its own `etc2` token and EasyTier relay protocol;
+it does not read Tailcat tokens.
 
 ## License
 

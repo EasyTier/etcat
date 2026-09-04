@@ -37,10 +37,9 @@ pub enum GatewayHandshakeError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Destination {
-    Stream,
+    Ping,
     ServerPort { port: u16 },
     ExitNode { host: String, port: u16 },
-    NoAuthSsh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,7 +485,7 @@ mod tests {
         let error = client_handshake(
             &mut client,
             "network",
-            Destination::NoAuthSsh,
+            Destination::ServerPort { port: 22 },
             &fingerprint,
             &[8_u8; 32],
         )
@@ -546,7 +545,7 @@ mod tests {
         let error = client_handshake(
             &mut client,
             "network",
-            Destination::NoAuthSsh,
+            Destination::ServerPort { port: 22 },
             &fingerprint,
             &authentication_key,
         )

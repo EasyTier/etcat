@@ -17,34 +17,29 @@ use tokio::{
 };
 
 use crate::{
-    cli::{Cli, Command, GenkeyArgs},
-    crypto::{
-        client_public_key, generate_client_key, open_credential, seal_credential,
-        validate_public_key,
-    },
+    cli::{Cli, Command, GenkeyArgs, ServeArgs},
+    client::{Client, ClientOptions, ConnectionPath},
+    crypto::{client_public_key, generate_client_key, seal_credential, validate_public_key},
     identity::{
         ServerIdentity as PrivateServerIdentity, credential_authentication_key,
         generate_credential_secret, server_fingerprint,
     },
     key::{SavedKey, SavedServerKey},
-    network::{
-        AccessPolicy, CLIENT_GROUP, MeshInstance, client_config, managed_credential, server_config,
-        tcp_forward,
-    },
-    protocol::{Destination, GatewayHandshakeError, client_handshake, server_handshake},
+    network::{AccessPolicy, CLIENT_GROUP, MeshInstance, managed_credential, server_config},
+    protocol::{Destination, server_handshake},
     relay::{Relay, RelayRegistry},
     service::ServePolicy,
     token::{
         ConnectionToken, CredentialEnvelope, RelayLocator, ServerIdentity as TokenServerIdentity,
-        has_token_prefix, recipient_matches_public_key,
+        has_token_prefix,
     },
 };
 
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub async fn run(cli: Cli) -> Result<()> {
+pub(crate) async fn run(cli: Cli) -> Result<()> {
     init_logging(cli.verbose);
-    if cli.readme {
+    if cli.readme || matches!(cli.command, Some(Command::Readme)) {
         print!("{}", include_str!("../README.md"));
         return Ok(());
     }
@@ -54,6 +49,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         "no positional arguments are valid along with --serve"
     );
     match cli.command.as_ref() {
+        Some(Command::Serve(args)) => run_server(&cli, ServerOptions::from_serve(&cli, args)).await,
         Some(Command::Parse(args)) => parse_token(&args.token),
         Some(Command::Resolve(args)) => {
             let registry = RelayRegistry::load(cli.relay_file.as_deref())?;
@@ -68,9 +64,60 @@ pub async fn run(cli: Cli) -> Result<()> {
             ping(&args.token, &args.timeout, args.until_direct, &cli).await
         }
         Some(Command::Socks(args)) => run_socks(args, &cli).await,
-        Some(Command::Ssh(args)) => run_ssh(args, &cli).await,
+        Some(Command::Ssh(args)) => run_ssh(args, &cli),
+        Some(Command::Forward(args)) => run_forward(args, &cli).await,
+        Some(Command::Recv(args)) => run_recv(args, &cli).await,
+        Some(Command::Cp(args)) => run_cp(args, &cli),
+        Some(Command::Ls(args)) => run_ls(args, &cli).await,
+        Some(Command::Version) => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some(Command::Readme) => unreachable!("handled before command dispatch"),
         None if cli.target.is_some() => run_client(&cli).await,
-        None => run_server(&cli).await,
+        None => run_server(&cli, ServerOptions::from_root(&cli)).await,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServerOptions {
+    services: Vec<String>,
+    allow: Vec<String>,
+    full_address: bool,
+    json: bool,
+    ttl: Option<String>,
+    files: Option<String>,
+}
+
+impl ServerOptions {
+    fn from_root(cli: &Cli) -> Self {
+        Self {
+            services: cli.serve.clone(),
+            allow: cli.allow.clone(),
+            full_address: cli.full_address,
+            json: cli.json,
+            ttl: cli.ttl.clone(),
+            files: None,
+        }
+    }
+
+    fn from_serve(cli: &Cli, args: &ServeArgs) -> Self {
+        let mut services = args.services.clone();
+        if args.files.is_some() && !services.iter().any(|service| service == "files") {
+            services.push("files".to_owned());
+        }
+        Self {
+            services,
+            allow: if args.allow.is_empty() {
+                cli.allow.clone()
+            } else {
+                args.allow.clone()
+            },
+            full_address: args.full_address || cli.full_address,
+            json: cli.json,
+            ttl: args.ttl.clone().or_else(|| cli.ttl.clone()),
+            files: args.files.clone(),
+        }
     }
 }
 
@@ -154,14 +201,19 @@ async fn genkey(args: &GenkeyArgs, relay_file: Option<&Path>) -> Result<()> {
         }
         return Ok(());
     }
+    if !args.client && args.relay.as_deref() == Some("list") {
+        return list_relays(relay_file);
+    }
+    let name = args
+        .key
+        .as_deref()
+        .context("genkey requires --key=<name|path>")?;
     if args.client {
         anyhow::ensure!(
             args.relay.is_none() && !args.fixed_relay && !args.full_address,
             "genkey --client does not take relay selection flags"
         );
-        let name = args.key.as_deref().unwrap_or("client-default");
         if args.delete {
-            anyhow::ensure!(args.key.is_some(), "genkey --delete requires --key=<name>");
             crate::key::delete(name)?;
             return Ok(());
         }
@@ -173,17 +225,12 @@ async fn genkey(args: &GenkeyArgs, relay_file: Option<&Path>) -> Result<()> {
         println!("{}", client_public_key(&saved.private_key)?);
         return Ok(());
     }
-    let name = args.key.as_deref().unwrap_or("default");
     if args.delete {
-        anyhow::ensure!(args.key.is_some(), "genkey --delete requires --key=<name>");
         crate::key::delete(name)?;
         return Ok(());
     }
 
     let registry = RelayRegistry::load(relay_file)?;
-    if args.relay.as_deref() == Some("list") {
-        return list_relays(relay_file);
-    }
     anyhow::ensure!(
         !(args.fixed_relay && args.relay.is_some()),
         "genkey --fixed-region and --region are mutually exclusive"
@@ -217,23 +264,28 @@ async fn genkey(args: &GenkeyArgs, relay_file: Option<&Path>) -> Result<()> {
 }
 
 fn print_public_key(name: Option<&str>) -> Result<()> {
-    let name = name.unwrap_or("client-default");
-    match crate::key::load(name)? {
-        SavedKey::Client(client) => {
-            println!("{}", client_public_key(&client.private_key)?);
-            Ok(())
+    let saved = match name {
+        Some("new") => None,
+        Some(name) => Some((name, crate::key::load(name)?)),
+        None if crate::key::key_path("client-default")?.exists() => {
+            Some(("client-default", crate::key::load("client-default")?))
         }
-        SavedKey::Server(_) => anyhow::bail!("{name:?} is a server key, not a client key"),
-    }
+        None => None,
+    };
+    let private_key = match saved {
+        Some((_, SavedKey::Client(client))) => client.private_key,
+        Some((name, SavedKey::Server(_))) => {
+            anyhow::bail!("{name:?} is a server key, not a client key")
+        }
+        None => generate_client_key(),
+    };
+    println!("{}", client_public_key(&private_key)?);
+    Ok(())
 }
 
-async fn run_server(cli: &Cli) -> Result<()> {
-    let policy = ServePolicy::parse(&cli.serve)?;
-    #[cfg(not(unix))]
-    anyhow::ensure!(
-        !policy.no_auth_ssh,
-        "the built-in no-auth SSH server is only supported on Unix"
-    );
+async fn run_server(cli: &Cli, options: ServerOptions) -> Result<()> {
+    let policy = ServePolicy::parse(&options.services)?;
+    let file_service = configured_file_service(&options, &policy)?;
     let registry = RelayRegistry::load(cli.relay_file.as_deref())?;
     let material = server_material(cli, &registry).await?;
 
@@ -245,13 +297,19 @@ async fn run_server(cli: &Cli) -> Result<()> {
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?
     };
     let gateway_port = gateway.local_addr()?.port();
-    let expires_unix = expiry_from_ttl(cli.ttl.as_deref())?;
+    let expires_unix = expiry_from_ttl(options.ttl.as_deref())?;
     let initial_relay = material
         .relays
         .first()
         .expect("server relay candidates are never empty");
-    let (credentials, credential_token, authentication_keys) =
-        prepare_credentials_and_token(cli, &material, initial_relay, gateway_port, expires_unix)?;
+    let (credentials, credential_token, authentication_keys) = prepare_credentials_and_token(
+        &options.allow,
+        options.full_address,
+        &material,
+        initial_relay,
+        gateway_port,
+        expires_unix,
+    )?;
     let access = AccessPolicy {
         destination_ip: material.identity.gateway_ipv4(),
         ports: vec![gateway_port],
@@ -262,63 +320,139 @@ async fn run_server(cli: &Cli) -> Result<()> {
         credential_token.credential,
         &relay,
         gateway_port,
-        cli.full_address,
+        options.full_address,
         expires_unix,
     )?;
     let encoded = token.encode()?;
-    report_server_address(cli, &encoded, &relay, material.saved_key_name.as_deref()).await?;
+    report_server_address(
+        options.json,
+        &encoded,
+        &relay,
+        material.saved_key_name.as_deref(),
+    )
+    .await?;
 
     let signing_key = Arc::new(material.identity.signing_key()?);
     let authentication_keys = Arc::new(authentication_keys);
     let policy = Arc::new(policy);
-    let gateway_slots = Arc::new(Semaphore::new(256));
-    let stream_mode = cli.serve.is_empty();
-    loop {
-        tokio::select! {
-            accepted = gateway.accept() => {
-                let (stream, _) = accepted?;
-                if stream_mode {
-                    match handle_stream_connection(
-                        stream,
-                        &material.identity.network_name,
-                        signing_key.as_ref(),
-                        &authentication_keys,
-                        expires_unix,
-                    ).await {
-                        Ok(()) => break,
-                        Err(error) => {
-                            tracing::debug!(?error, "gateway connection closed");
-                            continue;
-                        }
-                    }
-                }
-                let network_name = material.identity.network_name.clone();
-                let Ok(slot) = gateway_slots.clone().try_acquire_owned() else {
-                    tracing::warn!("gateway connection limit reached");
-                    continue;
-                };
-                let signing_key = signing_key.clone();
-                let policy = policy.clone();
-                let authentication_keys = authentication_keys.clone();
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    if let Err(error) = handle_service_connection(
-                        stream,
-                        &network_name,
-                        signing_key.as_ref(),
-                        &authentication_keys,
-                        expires_unix,
-                        &policy,
-                    ).await {
-                        tracing::debug!(?error, "gateway connection closed");
-                    }
-                });
-            }
-            _ = tokio::signal::ctrl_c() => break,
-        }
+    let file_service = Arc::new(file_service);
+    let stream_mode = options.services.is_empty() && options.files.is_none();
+    GatewayRuntime {
+        gateway,
+        network_name: material.identity.network_name.clone(),
+        signing_key,
+        authentication_keys,
+        expires_unix,
+        policy,
+        file_service,
     }
+    .run(stream_mode)
+    .await?;
     mesh.stop().await;
     Ok(())
+}
+
+struct GatewayRuntime {
+    gateway: TcpListener,
+    network_name: String,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    authentication_keys: Arc<Vec<[u8; 32]>>,
+    expires_unix: Option<i64>,
+    policy: Arc<ServePolicy>,
+    file_service: Arc<Option<crate::file_service::FileService>>,
+}
+
+impl GatewayRuntime {
+    async fn run(&self, stream_mode: bool) -> Result<()> {
+        let gateway_slots = Arc::new(Semaphore::new(256));
+        loop {
+            tokio::select! {
+                accepted = self.gateway.accept() => {
+                    let (stream, _) = accepted?;
+                    if stream_mode {
+                        match handle_stream_connection(
+                            stream,
+                            &self.network_name,
+                            self.signing_key.as_ref(),
+                            &self.authentication_keys,
+                            self.expires_unix,
+                        ).await {
+                            Ok(true) => break,
+                            Ok(false) => continue,
+                            Err(error) => {
+                                tracing::debug!(?error, "gateway connection closed");
+                                continue;
+                            }
+                        }
+                    }
+                    let network_name = self.network_name.clone();
+                    let Ok(slot) = gateway_slots.clone().try_acquire_owned() else {
+                        tracing::warn!("gateway connection limit reached");
+                        continue;
+                    };
+                    let signing_key = self.signing_key.clone();
+                    let policy = self.policy.clone();
+                    let file_service = self.file_service.clone();
+                    let authentication_keys = self.authentication_keys.clone();
+                    let expires_unix = self.expires_unix;
+                    tokio::spawn(async move {
+                        let _slot = slot;
+                        if let Err(error) = handle_service_connection(
+                            stream,
+                            &network_name,
+                            signing_key.as_ref(),
+                            &authentication_keys,
+                            expires_unix,
+                            &policy,
+                            file_service.as_ref().clone(),
+                        ).await {
+                            tracing::debug!(?error, "gateway connection closed");
+                        }
+                    });
+                }
+                _ = tokio::signal::ctrl_c() => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn configured_file_service(
+    options: &ServerOptions,
+    policy: &ServePolicy,
+) -> Result<Option<crate::file_service::FileService>> {
+    if !policy.files {
+        return Ok(None);
+    }
+    let (root, mode) = options.files.as_deref().map_or_else(
+        || {
+            Ok((
+                std::env::current_dir()?,
+                crate::file_service::FileMode::ReadOnly,
+            ))
+        },
+        parse_file_spec,
+    )?;
+    Ok(Some(
+        crate::file_service::FileService::new(&root, mode)
+            .with_context(|| format!("failed to open file service root {}", root.display()))?,
+    ))
+}
+
+fn parse_file_spec(value: &str) -> Result<(PathBuf, crate::file_service::FileMode)> {
+    let split = value
+        .rsplit_once(':')
+        .filter(|(path, _)| !(path.len() == 1 && path.as_bytes()[0].is_ascii_alphabetic()));
+    let (path, mode) = match split {
+        Some((path, mode)) => (
+            path,
+            mode.parse::<crate::file_service::FileMode>()
+                .with_context(|| format!("invalid --files value {value:?}"))?,
+        ),
+        None => (value, crate::file_service::FileMode::ReadOnly),
+    };
+    anyhow::ensure!(!path.is_empty(), "file service root cannot be empty");
+    Ok((PathBuf::from(path), mode))
 }
 
 struct ServerMaterial {
@@ -445,19 +579,20 @@ fn make_token(
 }
 
 fn prepare_credentials_and_token(
-    cli: &Cli,
+    allow: &[String],
+    full_address: bool,
     material: &ServerMaterial,
     relay: &Relay,
     gateway_port: u16,
     expires_unix: Option<i64>,
 ) -> Result<(Vec<ManagedCredentialConfig>, ConnectionToken, Vec<[u8; 32]>)> {
     let expiry = expires_unix.unwrap_or(i64::MAX);
-    let deny_all = cli.allow.as_slice() == ["none"];
+    let deny_all = allow == ["none"];
     anyhow::ensure!(
-        !cli.allow.iter().any(|value| value == "none") || deny_all,
+        !allow.iter().any(|value| value == "none") || deny_all,
         "--allow=none cannot be combined with client public keys"
     );
-    if cli.allow.is_empty() || deny_all {
+    if allow.is_empty() || deny_all {
         let credentials = if deny_all {
             Vec::new()
         } else {
@@ -475,7 +610,7 @@ fn prepare_credentials_and_token(
             },
             relay,
             gateway_port,
-            cli.full_address,
+            full_address,
             expires_unix,
         )?;
         let authentication_keys = if deny_all {
@@ -486,10 +621,10 @@ fn prepare_credentials_and_token(
         return Ok((credentials, token, authentication_keys));
     }
 
-    let mut credentials = Vec::with_capacity(cli.allow.len());
-    let mut pending = Vec::with_capacity(cli.allow.len());
-    let mut recipients = std::collections::HashSet::with_capacity(cli.allow.len());
-    for (index, recipient) in cli.allow.iter().enumerate() {
+    let mut credentials = Vec::with_capacity(allow.len());
+    let mut pending = Vec::with_capacity(allow.len());
+    let mut recipients = std::collections::HashSet::with_capacity(allow.len());
+    for (index, recipient) in allow.iter().enumerate() {
         validate_public_key(recipient)
             .with_context(|| format!("invalid --allow public key {recipient:?}"))?;
         anyhow::ensure!(
@@ -516,7 +651,7 @@ fn prepare_credentials_and_token(
         },
         relay,
         gateway_port,
-        cli.full_address,
+        full_address,
         expires_unix,
     )?;
     let aad = token.credential_aad()?;
@@ -535,7 +670,7 @@ fn prepare_credentials_and_token(
 }
 
 async fn report_server_address(
-    cli: &Cli,
+    json: bool,
     token: &str,
     relay: &Relay,
     saved_key_name: Option<&str>,
@@ -549,7 +684,7 @@ async fn report_server_address(
     } else {
         eprintln!("# 🐈 Server listening with new address: {token}");
     }
-    if cli.json {
+    if json {
         println!("{}", serde_json::json!({ "listenAddr": token }));
     }
     if let Some(destination) = std::env::var("ETCAT_ADDR_FILE")
@@ -598,7 +733,7 @@ async fn handle_stream_connection(
     signing_key: &ed25519_dalek::SigningKey,
     authentication_keys: &[[u8; 32]],
     authentication_expiry: Option<i64>,
-) -> Result<()> {
+) -> Result<bool> {
     let (destination, ()) = server_handshake(
         &mut stream,
         network_name,
@@ -607,16 +742,21 @@ async fn handle_stream_connection(
         authentication_expiry,
         |destination| async move {
             anyhow::ensure!(
-                destination == Destination::Stream,
+                matches!(
+                    destination,
+                    Destination::Ping | Destination::ServerPort { .. }
+                ),
                 "server is in stream mode"
             );
             Ok(())
         },
     )
     .await?;
-    debug_assert_eq!(destination, Destination::Stream);
+    if destination == Destination::Ping {
+        return Ok(false);
+    }
     copy(&mut stream, &mut tokio::io::stdout()).await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn handle_service_connection(
@@ -626,8 +766,10 @@ async fn handle_service_connection(
     authentication_keys: &[[u8; 32]],
     authentication_expiry: Option<i64>,
     policy: &ServePolicy,
+    file_service: Option<crate::file_service::FileService>,
 ) -> Result<()> {
     enum ConnectedDestination {
+        Ping,
         Tcp(TcpStream),
         Ssh,
     }
@@ -640,7 +782,11 @@ async fn handle_service_connection(
         authentication_expiry,
         |destination| async move {
             match &destination {
+                Destination::Ping => Ok(ConnectedDestination::Ping),
                 Destination::ServerPort { port } => {
+                    if *port == 22 && (policy.no_auth_ssh || policy.files) {
+                        return Ok(ConnectedDestination::Ssh);
+                    }
                     anyhow::ensure!(policy.allows(*port), "TCP port {port} is not served");
                     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port);
                     connect_destination(address, address.to_string())
@@ -658,24 +804,15 @@ async fn handle_service_connection(
                         .await
                         .map(ConnectedDestination::Tcp)
                 }
-                Destination::NoAuthSsh => policy
-                    .no_auth_ssh
-                    .then_some(ConnectedDestination::Ssh)
-                    .context("no-auth SSH is disabled"),
-                Destination::Stream => anyhow::bail!("server is not in stream mode"),
             }
         },
     )
     .await?;
     match connected {
+        ConnectedDestination::Ping => Ok(()),
         ConnectedDestination::Ssh => {
-            debug_assert_eq!(destination, Destination::NoAuthSsh);
-            #[cfg(unix)]
-            {
-                crate::ssh_server::serve(stream).await
-            }
-            #[cfg(not(unix))]
-            anyhow::bail!("no-auth SSH is unavailable on this platform");
+            debug_assert_eq!(destination, Destination::ServerPort { port: 22 });
+            crate::ssh_server::serve(stream, policy.no_auth_ssh, file_service).await
         }
         ConnectedDestination::Tcp(mut target) => {
             copy_bidirectional(&mut stream, &mut target).await?;
@@ -697,128 +834,19 @@ where
 async fn run_client(cli: &Cli) -> Result<()> {
     let target = cli.target.as_deref().context("missing connection token")?;
     let token = resolve_target(target).await?;
-    let session =
-        ClientSession::start(token, cli.relay_file.as_deref(), cli.key.as_deref()).await?;
+    let session = Client::connect(token, &client_options(cli)).await?;
     let stream = session
-        .connect(parse_destination(cli.destination.as_deref())?)
+        .connect_destination(parse_destination(cli.destination.as_deref())?)
         .await?;
     copy_stdio(stream).await
 }
 
-struct ClientSession {
-    _mesh: MeshInstance,
-    gateway: SocketAddr,
-    network_name: String,
-    server_fingerprint: [u8; 16],
-    authentication_key: [u8; 32],
-}
-
-impl ClientSession {
-    async fn start(
-        token: ConnectionToken,
-        relay_file: Option<&Path>,
-        key_name: Option<&str>,
-    ) -> Result<Self> {
-        let registry = RelayRegistry::load(relay_file)?;
-        let relay = resolve_relay(&token, &registry)?;
-        let (credential_secret, client_ipv4) = client_credential(&token, key_name)?;
-        let authentication_key = credential_authentication_key(&credential_secret)?;
-        let gateway_port = token.server.gateway_port;
-        let server_ip = token.gateway_ipv4()?;
-        let network_name = token.network_name()?;
-        let client_ip = client_ipv4.parse::<Ipv4Addr>()?;
-        let local_port = reserve_bound_port().await?;
-        let forward = tcp_forward(
-            local_port,
-            SocketAddr::new(IpAddr::V4(server_ip), gateway_port),
-        );
-        let config = client_config(
-            &network_name,
-            &credential_secret,
-            client_ip,
-            &relay,
-            vec![forward],
-            None,
-        )?;
-        let mesh = MeshInstance::start(config).await?;
-        let server_fingerprint = token.server_fingerprint()?;
-        wait_for_gateway_route(&mesh, server_ip, Duration::from_secs(30)).await?;
-        Ok(Self {
-            _mesh: mesh,
-            gateway: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port),
-            network_name,
-            server_fingerprint,
-            authentication_key,
-        })
+fn client_options(cli: &Cli) -> ClientOptions {
+    ClientOptions {
+        relay_file: cli.relay_file.clone(),
+        key: cli.key.clone(),
+        private_key: None,
     }
-
-    async fn connect(&self, destination: Destination) -> Result<TcpStream> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let mut stream = connect_with_retry(self.gateway, Duration::from_secs(2)).await?;
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let handshake = tokio::time::timeout(
-                remaining,
-                client_handshake(
-                    &mut stream,
-                    &self.network_name,
-                    destination.clone(),
-                    &self.server_fingerprint,
-                    &self.authentication_key,
-                ),
-            )
-            .await;
-            match handshake {
-                Ok(Ok(())) => return Ok(stream),
-                Ok(Err(error)) if error.downcast_ref::<GatewayHandshakeError>().is_some() => {
-                    return Err(error);
-                }
-                Ok(Err(error)) if tokio::time::Instant::now() >= deadline => return Err(error),
-                Err(_) if tokio::time::Instant::now() >= deadline => {
-                    anyhow::bail!("timed out authenticating the etcat gateway")
-                }
-                Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-            }
-        }
-    }
-}
-
-async fn wait_for_gateway_route(
-    mesh: &MeshInstance,
-    gateway_ip: Ipv4Addr,
-    timeout: Duration,
-) -> Result<()> {
-    let expected = format!("{gateway_ip}/32");
-    let canonical = gateway_ip.to_string();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let routes = mesh.core().route_snapshots().await;
-        if routes.iter().any(|route| {
-            route
-                .proxy_cidrs
-                .iter()
-                .any(|cidr| cidr == &canonical || cidr == &expected)
-        }) {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let announced = routes
-                .iter()
-                .flat_map(|route| route.proxy_cidrs.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            anyhow::bail!(
-                "gateway route {expected} was not announced after {timeout:?}; announced proxy routes: {announced:?}"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-#[derive(Clone)]
-struct ClientOptions {
-    relay_file: Option<std::path::PathBuf>,
-    key_name: Option<String>,
 }
 
 async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
@@ -841,17 +869,11 @@ async fn run_socks(args: &crate::cli::SocksArgs, cli: &Cli) -> Result<()> {
     };
     let options = ClientOptions {
         relay_file: cli.relay_file.clone(),
-        key_name: cli.key.clone(),
+        key: cli.key.clone(),
+        private_key: None,
     };
     let fixed = if let Some(token) = fixed_token {
-        Some(Arc::new(
-            ClientSession::start(
-                token,
-                options.relay_file.as_deref(),
-                options.key_name.as_deref(),
-            )
-            .await?,
-        ))
+        Some(Arc::new(Client::connect(token, &options).await?))
     } else {
         None
     };
@@ -889,77 +911,117 @@ fn resolve_executable(command: &String) -> Option<PathBuf> {
     which::which(command).ok()
 }
 
-async fn run_ssh(args: &crate::cli::SshArgs, cli: &Cli) -> Result<()> {
-    use sha2::{Digest, Sha256};
-
+fn run_ssh(args: &crate::cli::SshArgs, cli: &Cli) -> Result<()> {
     let (user, target) = args
         .target
         .split_once('@')
         .map_or((None, args.target.as_str()), |(user, target)| {
             (Some(user), target)
         });
-    let destination = args.destination.as_deref().map_or_else(
-        || "ssh".to_owned(),
-        |value| {
-            value.parse::<IpAddr>().map_or_else(
-                |_| value.to_owned(),
-                |ip| SocketAddr::new(ip, 22).to_string(),
-            )
-        },
-    );
-    let executable = std::env::current_exe().context("failed to locate etcat executable")?;
-    let mut proxy_arguments = vec![executable.to_string_lossy().into_owned()];
-    if let Some(key) = &cli.key {
-        proxy_arguments.push(format!("--key={key}"));
-    }
-    if let Some(relay_file) = &cli.relay_file {
-        proxy_arguments.push(format!("--relay-file={}", relay_file.display()));
-    }
-    proxy_arguments.push("--".to_owned());
-    proxy_arguments.push(target.to_owned());
-    proxy_arguments.push(destination);
-    let proxy_command = proxy_arguments
-        .iter()
-        .map(|argument| quote_proxy_argument(argument))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let hash = Sha256::digest(target.as_bytes());
-    let host = format!("etcat-{}", hex::encode(&hash[..8]));
+    let destination = crate::ssh_proxy::destination(args.destination.as_deref());
+    let host = crate::ssh_proxy::host_alias(target);
     let ssh_target = user.map_or(host.clone(), |user| format!("{user}@{host}"));
-    let status = ProcessCommand::new("ssh")
-        .args([
-            "-o",
-            "UpdateHostKeys=no",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-            "-o",
-            &format!("ProxyCommand={proxy_command}"),
-            &ssh_target,
-        ])
-        .args(&args.command)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .await
-        .context("failed to run the system OpenSSH client")?;
-    anyhow::ensure!(status.success(), "ssh exited with {status}");
-    Ok(())
+    let mut command = std::process::Command::new("ssh");
+    crate::ssh_proxy::configure(&mut command, cli, target, &destination)?;
+    command.arg(ssh_target).args(&args.command);
+    crate::ssh_proxy::launch(command, "ssh")
 }
 
-#[cfg(unix)]
-fn quote_proxy_argument(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+async fn run_forward(args: &crate::cli::ForwardArgs, cli: &Cli) -> Result<()> {
+    let token = resolve_target(&args.target).await?;
+    let session = Arc::new(Client::connect(token, &client_options(cli)).await?);
+    let bind = args
+        .bind
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid --bind IP address {:?}", args.bind))?;
+    let mappings = crate::forward::parse_mappings(&args.mappings)?;
+    crate::forward::run(Some(bind), mappings, move |destination| {
+        let session = session.clone();
+        async move { session.connect_destination(destination).await }
+    })
+    .await
 }
 
-#[cfg(windows)]
-fn quote_proxy_argument(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
+async fn run_recv(args: &crate::cli::RecvArgs, cli: &Cli) -> Result<()> {
+    let mode = if args.accept_dirs { "wo+" } else { "wo" };
+    let files = format!("{}:{mode}", args.directory.display());
+    run_server(
+        cli,
+        ServerOptions {
+            services: vec!["files".to_owned()],
+            allow: Vec::new(),
+            full_address: false,
+            json: cli.json,
+            ttl: None,
+            files: Some(files),
+        },
+    )
+    .await
+}
+
+fn run_cp(args: &crate::cli::CpArgs, cli: &Cli) -> Result<()> {
+    let remotes = args
+        .paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| parse_remote_path(path).map(|remote| (index, remote)))
+        .collect::<Vec<_>>();
+    let first = remotes
+        .first()
+        .map(|(_, remote)| *remote)
+        .context("cp requires at least one remote path containing an etc2 token or DNS name")?;
+    anyhow::ensure!(
+        remotes
+            .iter()
+            .all(|(_, remote)| remote.target == first.target),
+        "all remote paths must use the same server"
+    );
+
+    let alias = crate::ssh_proxy::host_alias(first.target);
+    let mut paths = args.paths.clone();
+    for (index, remote) in remotes {
+        paths[index] = remote.user.map_or_else(
+            || format!("{alias}:{}", remote.path),
+            |user| format!("{user}@{alias}:{}", remote.path),
+        );
+    }
+
+    let destination = crate::ssh_proxy::destination(args.destination.as_deref());
+    let mut command = std::process::Command::new("scp");
+    crate::ssh_proxy::configure(&mut command, cli, first.target, &destination)?;
+    if args.recursive {
+        command.arg("-r");
+    }
+    if args.preserve {
+        command.arg("-p");
+    }
+    command.args(paths);
+    crate::ssh_proxy::launch(command, "scp")
+}
+
+async fn run_ls(args: &crate::cli::LsArgs, cli: &Cli) -> Result<()> {
+    let (target, path) = args.target.split_once(':').unwrap_or((&args.target, "."));
+    let token = resolve_target(target).await?;
+    let session = Client::connect(token, &client_options(cli)).await?;
+    let stream = session.dial_port(22).await?;
+    let client = crate::file_client::FileClient::connect(stream).await?;
+    client.list(path, args.long).await?;
+    client.close().await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemotePath<'a> {
+    user: Option<&'a str>,
+    target: &'a str,
+    path: &'a str,
+}
+
+fn parse_remote_path(value: &str) -> Option<RemotePath<'_>> {
+    let (host, path) = value.split_once(':')?;
+    let (user, target) = host
+        .split_once('@')
+        .map_or((None, host), |(user, target)| (Some(user), target));
+    (has_token_prefix(target) || target.contains('.')).then_some(RemotePath { user, target, path })
 }
 
 fn normalize_listen_address(value: &str) -> Result<String> {
@@ -985,7 +1047,7 @@ fn normalize_listen_address(value: &str) -> Result<String> {
 
 async fn serve_socks(
     listener: TcpListener,
-    fixed: Option<Arc<ClientSession>>,
+    fixed: Option<Arc<Client>>,
     options: ClientOptions,
 ) -> Result<()> {
     loop {
@@ -1002,7 +1064,7 @@ async fn serve_socks(
 
 async fn handle_socks_connection(
     mut stream: TcpStream,
-    fixed: Option<Arc<ClientSession>>,
+    fixed: Option<Arc<Client>>,
     options: &ClientOptions,
 ) -> Result<()> {
     let mut greeting = [0_u8; 2];
@@ -1053,12 +1115,7 @@ async fn handle_socks_connection(
             Destination::ServerPort { port },
         )
     } else if let Ok(token) = decode_token(&host) {
-        dynamic = ClientSession::start(
-            token,
-            options.relay_file.as_deref(),
-            options.key_name.as_deref(),
-        )
-        .await?;
+        dynamic = Client::connect(token, options).await?;
         (&dynamic, Destination::ServerPort { port })
     } else {
         let session = fixed
@@ -1067,7 +1124,7 @@ async fn handle_socks_connection(
         (session, Destination::ExitNode { host, port })
     };
 
-    match session.connect(destination).await {
+    match session.connect_destination(destination).await {
         Ok(mut remote) => {
             stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
             copy_bidirectional(&mut stream, &mut remote).await?;
@@ -1082,11 +1139,8 @@ async fn handle_socks_connection(
 
 fn parse_destination(value: Option<&str>) -> Result<Destination> {
     let Some(value) = value else {
-        return Ok(Destination::Stream);
+        return Ok(Destination::ServerPort { port: 1 });
     };
-    if value == "ssh" {
-        return Ok(Destination::NoAuthSsh);
-    }
     if value.contains(':') {
         let address = value
             .parse::<SocketAddr>()
@@ -1103,46 +1157,6 @@ fn parse_destination(value: Option<&str>) -> Result<Destination> {
     Ok(Destination::ServerPort { port })
 }
 
-fn resolve_relay(token: &ConnectionToken, registry: &RelayRegistry) -> Result<Relay> {
-    let relay = match &token.relay {
-        RelayLocator::Registry { id } => registry
-            .get(id)
-            .cloned()
-            .with_context(|| format!("relay {id:?} is not in this registry")),
-        RelayLocator::RegistryCode { code } => registry
-            .get_by_token_id(*code)
-            .cloned()
-            .with_context(|| format!("relay token ID {code} is not in this registry")),
-        RelayLocator::Inline { relay } => Ok(relay.clone()),
-    }?;
-    if relay.public_key.is_none() {
-        eprintln!(
-            "warning: shared relay {:?} is encrypted but its identity is not pinned",
-            relay.id
-        );
-    }
-    Ok(relay)
-}
-
-async fn reserve_bound_port() -> Result<u16> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
-
-async fn connect_with_retry(address: SocketAddr, timeout: Duration) -> Result<TcpStream> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match TcpStream::connect(address).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error.into()),
-            Err(_) => {}
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 async fn copy_stdio(stream: TcpStream) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let input = tokio::spawn(async move {
@@ -1157,79 +1171,28 @@ async fn copy_stdio(stream: TcpStream) -> Result<()> {
 async fn ping(token: &str, timeout: &str, until_direct: bool, cli: &Cli) -> Result<()> {
     let timeout = humantime::parse_duration(timeout).context("invalid --timeout")?;
     let token = resolve_target(token).await?;
-    let registry = RelayRegistry::load(cli.relay_file.as_deref())?;
-    let relay = resolve_relay(&token, &registry)?;
-    let (credential_secret, client_ipv4) = client_credential(&token, cli.key.as_deref())?;
-    let network_name = token.network_name()?;
-    let config = client_config(
-        &network_name,
-        &credential_secret,
-        client_ipv4.parse()?,
-        &relay,
-        Vec::new(),
-        None,
-    )?;
-    let mesh = MeshInstance::start(config).await?;
-    let server_ip = token.server_virtual_ipv4()?;
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let routes = mesh.core().route_snapshots().await;
-        if let Some(route) = routes.iter().find(|route| {
-            route
-                .ipv4_addr
-                .as_ref()
-                .and_then(|inet| inet.address.as_ref())
-                .is_some_and(|address| Ipv4Addr::from(address.addr) == server_ip)
-        }) {
-            let direct = route.cost == 1;
-            println!(
-                "pong in {}ms via {}",
-                route.path_latency.max(1),
-                if direct { "direct" } else { "shared relay" }
-            );
+    let options = client_options(cli);
+    tokio::time::timeout(timeout, async move {
+        let session = Client::connect(token, &options).await?;
+        loop {
+            let info = session.ping().await?;
+            let elapsed = info.round_trip.as_secs_f64() * 1_000.0;
+            let direct = info.path == ConnectionPath::Direct;
+            match info.path {
+                ConnectionPath::Direct => println!("pong in {elapsed:.1}ms via direct"),
+                ConnectionPath::Relay { region } => {
+                    println!("pong in {elapsed:.1}ms via shared relay ({region})");
+                }
+            }
             if direct || !until_direct {
-                mesh.stop().await;
+                session.stop().await;
                 return Ok(());
             }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            mesh.stop().await;
-            anyhow::bail!("no suitable path to the server after {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-fn client_credential(token: &ConnectionToken, key_name: Option<&str>) -> Result<(String, String)> {
-    match &token.credential {
-        CredentialEnvelope::Bearer { secret } => {
-            Ok((secret.clone(), token.client_ipv4(2)?.to_string()))
-        }
-        CredentialEnvelope::Sealed { recipients } => {
-            let key_name = key_name.unwrap_or("client-default");
-            let SavedKey::Client(client) = crate::key::load(key_name)
-                .with_context(|| format!("token requires client key {key_name:?}"))?
-            else {
-                anyhow::bail!("selected key is a server key, not a client key")
-            };
-            let public_key = client_public_key(&client.private_key)?;
-            let aad = token.credential_aad()?;
-            let mut matched = false;
-            let mut last_error = None;
-            for sealed in recipients {
-                if !recipient_matches_public_key(&sealed.recipient, &public_key)? {
-                    continue;
-                }
-                matched = true;
-                match open_credential(&client.private_key, sealed, &aad) {
-                    Ok(credential) => return Ok(credential),
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            anyhow::ensure!(matched, "selected client key is not allowed by this token");
-            Err(last_error.context("failed to open sealed client credential")?)
-        }
-    }
+    })
+    .await
+    .with_context(|| format!("no suitable path to the server after {timeout:?}"))?
 }
 
 fn expiry_from_ttl(value: Option<&str>) -> Result<Option<i64>> {
@@ -1270,10 +1233,7 @@ async fn resolve_target(value: &str) -> Result<ConnectionToken> {
     if has_token_prefix(value) {
         return decode_token(value);
     }
-    anyhow::ensure!(
-        value.contains('.'),
-        "argument is neither an etc2 connection token nor a DNS name"
-    );
+    validate_dns_target(value)?;
     let resolver = TokioResolver::builder(TokioConnectionProvider::default())?.build();
     let records = tokio::time::timeout(Duration::from_secs(5), resolver.txt_lookup(value))
         .await
@@ -1295,6 +1255,24 @@ async fn resolve_target(value: &str) -> Result<ConnectionToken> {
         }
     }
     anyhow::bail!("no 'etcat=' or 'tailcat=' TXT record found for {value:?}")
+}
+
+fn validate_dns_target(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        value.contains('.'),
+        "argument is neither an etc2 connection token nor a DNS name"
+    );
+    anyhow::ensure!(
+        !value.trim_end_matches('.').split('.').any(has_token_prefix),
+        "refusing DNS lookup because the name contains an etc2 connection token"
+    );
+    anyhow::ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+        "DNS name contains unsupported characters"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1331,6 +1309,67 @@ mod tests {
             "localhost:0"
         );
         assert_eq!(normalize_listen_address("").unwrap(), "0.0.0.0:0");
+    }
+
+    #[test]
+    fn default_and_ssh_connections_use_server_ports() {
+        assert_eq!(
+            parse_destination(None).unwrap(),
+            Destination::ServerPort { port: 1 }
+        );
+        assert_eq!(
+            parse_destination(Some("22")).unwrap(),
+            Destination::ServerPort { port: 22 }
+        );
+        assert!(parse_destination(Some("ssh")).is_err());
+    }
+
+    #[test]
+    fn refuses_to_leak_multilabel_tokens_to_dns() {
+        assert!(validate_dns_target("alias.example.com").is_ok());
+        assert!(validate_dns_target("alias.example.com.").is_ok());
+        assert!(validate_dns_target("prefix.etc2secret.part.example.com").is_err());
+        assert!(validate_dns_target("prefix.etc2secret.part.example.com.").is_err());
+    }
+
+    #[test]
+    fn recognizes_only_token_or_dns_scp_paths_as_remote() {
+        assert_eq!(
+            parse_remote_path("user@etc2abc:path"),
+            Some(RemotePath {
+                user: Some("user"),
+                target: "etc2abc",
+                path: "path",
+            })
+        );
+        assert_eq!(
+            parse_remote_path("files.example:path").unwrap().target,
+            "files.example"
+        );
+        assert_eq!(parse_remote_path("C:\\local\\file"), None);
+    }
+
+    #[test]
+    fn parses_file_service_roots_and_modes() {
+        assert_eq!(
+            parse_file_spec("/srv/public:rw").unwrap(),
+            (
+                PathBuf::from("/srv/public"),
+                crate::file_service::FileMode::ReadWrite
+            )
+        );
+        assert_eq!(
+            parse_file_spec(".").unwrap(),
+            (PathBuf::from("."), crate::file_service::FileMode::ReadOnly)
+        );
+        assert_eq!(
+            parse_file_spec("C:\\drop").unwrap(),
+            (
+                PathBuf::from("C:\\drop"),
+                crate::file_service::FileMode::ReadOnly
+            )
+        );
+        assert!(parse_file_spec("/srv/public:invalid").is_err());
     }
 
     #[test]
@@ -1401,9 +1440,15 @@ mod tests {
             saved_key_name: None,
         };
 
-        let (credentials, _, authentication_keys) =
-            prepare_credentials_and_token(&cli, &material, &material.relays[0], 49_152, None)
-                .unwrap();
+        let (credentials, _, authentication_keys) = prepare_credentials_and_token(
+            &cli.allow,
+            cli.full_address,
+            &material,
+            &material.relays[0],
+            49_152,
+            None,
+        )
+        .unwrap();
         assert!(credentials.is_empty());
         assert!(authentication_keys.is_empty());
     }
@@ -1430,9 +1475,15 @@ mod tests {
             saved_gateway_port: None,
             saved_key_name: None,
         };
-        let (_, token, _) =
-            prepare_credentials_and_token(&cli, &material, &material.relays[0], 49_152, None)
-                .unwrap();
+        let (_, token, _) = prepare_credentials_and_token(
+            &cli.allow,
+            cli.full_address,
+            &material,
+            &material.relays[0],
+            49_152,
+            None,
+        )
+        .unwrap();
         let encoded = token.encode().unwrap();
         assert!(
             encoded.len() <= 160,
@@ -1447,7 +1498,7 @@ mod tests {
             panic!("expected sealed credential")
         };
 
-        open_credential(
+        crate::crypto::open_credential(
             &private_key,
             &recipients[0],
             &resolved.credential_aad().unwrap(),
