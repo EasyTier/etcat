@@ -7,7 +7,10 @@ import {
   AccordionRoot,
   AccordionTrigger,
 } from "reka-ui";
+import { useI18n } from "@/lib/i18n";
 import { settings } from "@/lib/settings";
+
+const { t } = useI18n();
 </script>
 
 <template>
@@ -20,7 +23,7 @@ import { settings } from "@/lib/settings";
         <AccordionTrigger
           class="group flex w-full items-center justify-between px-4 py-3 text-sm text-slate-400 transition hover:text-slate-200"
         >
-          Advanced relay settings
+          {{ t("advanced.title") }}
           <ChevronDown
             class="size-4 transition-transform duration-200 group-data-[state=open]:rotate-180"
           />
@@ -28,7 +31,7 @@ import { settings } from "@/lib/settings";
       </AccordionHeader>
       <AccordionContent class="space-y-3 px-4 pb-4">
         <label class="block text-xs text-slate-500">
-          EasyTier WebSocket relay
+          {{ t("advanced.relayUrl") }}
           <input
             v-model="settings.relayUrl"
             type="text"
@@ -38,13 +41,13 @@ import { settings } from "@/lib/settings";
           />
         </label>
         <label class="block text-xs text-slate-500">
-          Relay public key (optional identity pin, base64)
+          {{ t("advanced.relayKey") }}
           <input
             v-model="settings.relayKey"
             type="text"
             autocomplete="off"
             spellcheck="false"
-            placeholder="optional"
+            :placeholder="t('advanced.relayKeyPlaceholder')"
             class="mt-1 w-full rounded-lg border border-edge bg-black/30 px-3 py-2 font-mono text-sm text-slate-200 outline-none transition focus:border-accent/60"
           />
         </label>
@@ -55,9 +58,9 @@ import { settings } from "@/lib/settings";
             class="mt-0.5 accent-cyan-400"
           />
           <span>
-            Reuse a persistent address
+            {{ t("advanced.persist") }}
             <span class="block text-slate-600">
-              Stores the private listener key in this browser
+              {{ t("advanced.persistHint") }}
             </span>
           </span>
         </label>

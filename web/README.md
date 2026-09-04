@@ -10,6 +10,18 @@ pnpm install
 pnpm dev        # http://localhost:5173
 ```
 
+## Behavior notes
+
+- **Auto-receive**: incoming payloads start buffering immediately (no
+  accept/decline step) so the sender sees progress at once. Valid UTF-8
+  payloads render as text with a copy button; everything else gets a Save
+  button backed by the in-memory buffer (File System Access API when
+  available, Blob download otherwise). Payloads over 512 MiB are rejected
+  with a clear error instead of exhausting memory.
+- **i18n**: the UI ships Chinese and English; it follows the browser language
+  by default, toggles in the header, persists to `localStorage`, and can be
+  forced with `?lang=zh|en`.
+
 ## Build and serve
 
 ```console

@@ -8,6 +8,7 @@ import {
   sha256Hex,
   storePersistentServerKey,
   transferPayload,
+  type EtcatBrowserConnection,
   type EtcatBrowserIncomingConnection,
   type EtcatBrowserServer,
   type EasyTierCoreEvent,
@@ -19,13 +20,13 @@ import { recordError, testState } from "./testhooks";
 import { requireWasmModule } from "./wasm";
 
 const RELAY_CONNECT_TIMEOUT_MS = 30_000;
-const STREAM_OPEN_TIMEOUT_MS = 5_000;
+const STREAM_OPEN_TIMEOUT_MS = 30_000;
+const STREAM_OPEN_ATTEMPT_MS = 5_000;
 
 export type TransferStatus =
   | "connecting"
   | "transferring"
   | "confirming"
-  | "awaiting-choice"
   | "done"
   | "failed";
 
@@ -41,10 +42,14 @@ export interface Transfer {
   startedAt: number;
   status: TransferStatus;
   error: string | null;
-  /** Completed received payload, when the user chose to view it. */
+  /** Decoded text of a completed text payload (either direction). */
   receivedText: string | null;
-  /** Blob URL for a completed received file buffered in memory. */
+  /** Blob URL of a completed received file, buffered in memory. */
   downloadUrl: string | null;
+  /** Re-runs a failed send with the original payload. */
+  retry: (() => void) | null;
+  /** Buffered payload of a completed received file, kept for saving. */
+  blob: Blob | null;
 }
 
 export type ListenerStatus =
@@ -78,6 +83,8 @@ function addTransfer(
     error: null,
     receivedText: null,
     downloadUrl: null,
+    retry: null,
+    blob: null,
     ...fields,
   });
   store.transfers.unshift(transfer);
@@ -193,24 +200,29 @@ export async function stopListener(): Promise<void> {
   const current = server;
   server = undefined;
   store.listener = { kind: "idle" };
+  // Closing the server closes every in-flight incoming stream, which fails
+  // those transfers out of the drain loop on its own.
   await current?.close().catch(() => undefined);
-  // Settle incoming connections still waiting for a user choice; their
-  // streams are already closed with the server, so resolve the pending
-  // handler promises and fail their cards instead of leaking them.
-  const pending = Array.from(pendingIncoming.values());
-  pendingIncoming.clear();
-  for (const { stream, transfer, resolve } of pending) {
-    transfer.status = "failed";
-    transfer.error = "Listener stopped";
-    await stream.close().catch(() => undefined);
-    resolve();
-  }
 }
 
 export function closeListenerOnPageHide(): void {
   window.addEventListener("pagehide", () => {
     void server?.close();
   });
+}
+
+/** Accepts a bare etc2 token or a pasted share link carrying ?token=. */
+function normalizeToken(raw: string): string {
+  const value = raw.trim();
+  if (value.startsWith("etc2")) return value;
+  try {
+    const url = new URL(value);
+    const token = url.searchParams.get("token");
+    if (token !== null && token.startsWith("etc2")) return token;
+  } catch {
+    // Not a URL; fall through with the raw value.
+  }
+  return value;
 }
 
 export function enqueueSend(
@@ -221,7 +233,7 @@ export function enqueueSend(
 ): Promise<void> {
   // Capture the token now: the queued payload must go to the receiver chosen
   // at submit time, not to whatever the input holds when the queue drains.
-  const token = pendingSend.token.trim();
+  const token = normalizeToken(pendingSend.token);
   // Serialize sends: one connection at a time keeps status readable and
   // avoids competing relay sessions.
   const run = sendQueue.then(() => sendPayload(token, name, kind, size, reader));
@@ -239,9 +251,52 @@ async function sendPayload(
   const transfer = addTransfer({ direction: "send", kind, name, size });
   if (token.length === 0) {
     transfer.status = "failed";
-    transfer.error = recordError(new Error("Enter an etc2 receiver token first"));
+    transfer.error = recordError(new Error("Paste the receiver's token or link first"));
     throw new Error(transfer.error);
   }
+  transfer.retry = () => {
+    transfer.status = "connecting";
+    transfer.error = null;
+    transfer.bytes = 0;
+    transfer.startedAt = Date.now();
+    const run = sendQueue.then(() => runSend(transfer, token, size, reader));
+    sendQueue = run.catch(() => undefined);
+    void run.catch(() => undefined);
+  };
+  await runSend(transfer, token, size, reader);
+}
+
+async function openStreamWithRetry(
+  connection: EtcatBrowserConnection,
+): Promise<EasyTierTcpStream> {
+  // Route sync over the relay can outlive a single 5 s connect attempt; retry
+  // transient connect failures until the overall budget is exhausted.
+  const deadline = Date.now() + STREAM_OPEN_TIMEOUT_MS;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error("Timed out opening a stream to the receiver");
+    }
+    try {
+      return await openEtcatStream(
+        connection,
+        { kind: "server_port", port: 1 },
+        Math.min(STREAM_OPEN_ATTEMPT_MS, remaining),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("DeadlineExceeded")) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+}
+
+async function runSend(
+  transfer: Transfer,
+  token: string,
+  size: number,
+  reader: (offset: number, length: number) => Promise<Uint8Array>,
+): Promise<void> {
   const { connected, onEvent } = waitForRelayEvent();
   let connection;
   let stream: EasyTierTcpStream | undefined;
@@ -256,11 +311,7 @@ async function sendPayload(
       RELAY_CONNECT_TIMEOUT_MS,
       "Timed out connecting to the relay; browsers need a reachable ws:// or wss:// EasyTier relay",
     );
-    stream = await openEtcatStream(
-      connection,
-      { kind: "server_port", port: 1 },
-      STREAM_OPEN_TIMEOUT_MS,
-    );
+    stream = await openStreamWithRetry(connection);
     transfer.status = "transferring";
     transfer.startedAt = Date.now();
     const sent = await transferPayload(stream, size, reader, (bytes) => {
@@ -283,6 +334,12 @@ async function sendPayload(
 
 /** Token for the next send, set by the send panel. */
 export const pendingSend = reactive({ token: "" });
+
+// Payloads larger than this stay out of the in-memory buffer; the browser
+// receive path is designed for files up to a few hundred MiB.
+const MAX_BUFFERED_RECEIVE_BYTES = 512 * 1024 * 1024;
+// Only decode payloads up to this size when sniffing for text.
+const MAX_TEXT_SNIFF_BYTES = 16 * 1024 * 1024;
 
 function handleIncoming(
   connection: EtcatBrowserIncomingConnection,
@@ -322,72 +379,95 @@ function handleIncoming(
     name: null,
     size: null,
   });
-  transfer.status = "awaiting-choice";
+  transfer.status = "transferring";
+  transfer.startedAt = Date.now();
+
   // The server closes the stream as soon as the returned promise settles, so
-  // stay pending until the user-chosen receive path finishes.
-  return new Promise<void>((resolve) => {
-    pendingIncoming.set(transfer.id, { stream, transfer, resolve });
-  });
+  // resolve only after the payload is fully buffered and presented.
+  return (async () => {
+    const chunks: Uint8Array[] = [];
+    let overflow = false;
+    try {
+      const total = await drainPayload(
+        stream,
+        (chunk) => {
+          if (transfer.bytes + chunk.byteLength > MAX_BUFFERED_RECEIVE_BYTES) {
+            overflow = true;
+            throw new Error("payload exceeds the browser receive limit");
+          }
+          chunks.push(Uint8Array.from(chunk));
+        },
+        (bytes) => {
+          transfer.bytes = bytes;
+        },
+      );
+      transfer.bytes = total;
+      presentReceivedPayload(transfer, chunks, total);
+      transfer.status = "done";
+    } catch (error) {
+      transfer.status = "failed";
+      transfer.error = overflow
+        ? "Payload too large to receive in the browser"
+        : recordError(error);
+    } finally {
+      await stream.close().catch(() => undefined);
+    }
+  })();
 }
 
-interface PendingIncoming {
-  stream: EasyTierTcpStream;
-  transfer: Transfer;
-  resolve: () => void;
-}
-
-const pendingIncoming = new Map<number, PendingIncoming>();
-
-export async function receiveAsText(id: number): Promise<void> {
-  const pending = pendingIncoming.get(id);
-  if (pending === undefined) return;
-  pendingIncoming.delete(id);
-  const { stream, transfer, resolve } = pending;
-  transfer.status = "transferring";
-  transfer.startedAt = Date.now();
-  try {
-    const decoder = new TextDecoder();
-    let text = "";
-    const total = await drainPayload(
-      stream,
-      (chunk) => {
-        text += decoder.decode(chunk, { stream: true });
-      },
-      (bytes) => {
-        transfer.bytes = bytes;
-      },
-    );
-    text += decoder.decode();
-    transfer.receivedText = text;
-    transfer.kind = "text";
-    transfer.bytes = total;
-    transfer.status = "done";
-  } catch (error) {
-    transfer.status = "failed";
-    transfer.error = recordError(error);
-  } finally {
-    await stream.close().catch(() => undefined);
-    resolve();
+function presentReceivedPayload(
+  transfer: Transfer,
+  chunks: Uint8Array[],
+  total: number,
+): void {
+  // Text sniffing: cheap NUL/control-byte sample first, then a strict UTF-8
+  // decode. Binary payloads become a downloadable blob instead.
+  if (total <= MAX_TEXT_SNIFF_BYTES) {
+    const sample = chunks[0]?.subarray(0, 8192) ?? new Uint8Array();
+    let looksBinary = false;
+    for (const byte of sample) {
+      if (byte === 0) {
+        looksBinary = true;
+        break;
+      }
+    }
+    if (!looksBinary) {
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      try {
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        transfer.kind = "text";
+        transfer.receivedText = text;
+        return;
+      } catch {
+        // Not valid UTF-8; fall through to file presentation.
+      }
+    }
   }
+  transfer.kind = "file";
+  transfer.blob = new Blob(chunks as unknown as BlobPart[]);
+  transfer.downloadUrl = URL.createObjectURL(transfer.blob);
 }
 
-export async function receiveAsFile(id: number, suggestedName: string): Promise<void> {
-  const pending = pendingIncoming.get(id);
-  if (pending === undefined) return;
-  pendingIncoming.delete(id);
-  const { stream, transfer, resolve } = pending;
-  transfer.status = "transferring";
-  transfer.kind = "file";
-  transfer.name = suggestedName;
-  transfer.startedAt = Date.now();
-
+/**
+ * Saves a completed received file. Prefers the File System Access API (the
+ * payload was already buffered, so this writes the blob out); falls back to a
+ * plain download link click. A cancelled picker is a no-op.
+ */
+export async function saveReceivedFile(id: number, suggestedName: string): Promise<void> {
+  const transfer = store.transfers.find((entry) => entry.id === id);
+  if (transfer === undefined || transfer.blob === null) return;
   const picker = (
     window as unknown as {
       showSaveFilePicker?: (options: {
         suggestedName: string;
       }) => Promise<{
         createWritable(): Promise<{
-          write(data: Uint8Array): Promise<void>;
+          write(data: Blob): Promise<void>;
           close(): Promise<void>;
           abort?(): Promise<void>;
         }>;
@@ -400,67 +480,42 @@ export async function receiveAsFile(id: number, suggestedName: string): Promise<
     try {
       handle = await picker({ suggestedName });
     } catch (error) {
-      // A cancelled picker must not drop the payload: the stream is still
-      // open and unconsumed, so hand the choice back to the user. Skip the
-      // close-and-settle path — the pending entry stays alive.
-      if (error instanceof Error && error.name === "AbortError") {
-        transfer.status = "awaiting-choice";
-        pendingIncoming.set(id, { stream, transfer, resolve });
-        return;
-      }
-      transfer.status = "failed";
-      transfer.error = recordError(error);
-      await stream.close().catch(() => undefined);
-      resolve();
-      return;
+      // Cancelled picker: the buffered payload stays put; nothing to do.
+      if (error instanceof Error && error.name === "AbortError") return;
+      throw error;
     }
+    const writable = await handle.createWritable();
     try {
-      const writable = await handle.createWritable();
-      try {
-        const total = await drainPayload(
-          stream,
-          (chunk) => writable.write(chunk),
-          (bytes) => {
-            transfer.bytes = bytes;
-          },
-        );
-        await writable.close();
-        transfer.bytes = total;
-      } catch (error) {
-        await writable.abort?.().catch(() => undefined);
-        throw error;
-      }
-      transfer.status = "done";
+      await writable.write(transfer.blob);
+      await writable.close();
     } catch (error) {
-      transfer.status = "failed";
-      transfer.error = recordError(error);
-    } finally {
-      await stream.close().catch(() => undefined);
-      resolve();
+      await writable.abort?.().catch(() => undefined);
+      throw error;
     }
     return;
   }
 
-  try {
-    const chunks: Uint8Array[] = [];
-    const total = await drainPayload(
-      stream,
-      (chunk) => {
-        chunks.push(Uint8Array.from(chunk));
-      },
-      (bytes) => {
-        transfer.bytes = bytes;
-      },
-    );
-    const blob = new Blob(chunks as unknown as BlobPart[]);
-    transfer.downloadUrl = URL.createObjectURL(blob);
-    transfer.bytes = total;
-    transfer.status = "done";
-  } catch (error) {
-    transfer.status = "failed";
-    transfer.error = recordError(error);
-  } finally {
-    await stream.close().catch(() => undefined);
-    resolve();
+  if (transfer.downloadUrl !== null) {
+    const anchor = document.createElement("a");
+    anchor.href = transfer.downloadUrl;
+    anchor.download = suggestedName;
+    anchor.click();
+  }
+}
+
+export function removeTransfer(id: number): void {
+  const index = store.transfers.findIndex((entry) => entry.id === id);
+  if (index === -1) return;
+  const [transfer] = store.transfers.splice(index, 1);
+  if (transfer !== undefined && transfer.downloadUrl !== null) {
+    URL.revokeObjectURL(transfer.downloadUrl);
+  }
+}
+
+export function clearFinishedTransfers(): void {
+  for (const transfer of [...store.transfers]) {
+    if (transfer.status === "done" || transfer.status === "failed") {
+      removeTransfer(transfer.id);
+    }
   }
 }

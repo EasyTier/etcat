@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { Download, ShieldCheck, Upload } from "lucide-vue-next";
+import { Download, Languages, ShieldCheck, Upload } from "lucide-vue-next";
 import {
   TabsContent,
   TabsList,
@@ -9,7 +9,8 @@ import {
 } from "reka-ui";
 import ReceivePanel from "./components/ReceivePanel.vue";
 import SendPanel from "./components/SendPanel.vue";
-import { startListener, closeListenerOnPageHide, enqueueSend, pendingSend } from "@/lib/transfers";
+import { useI18n } from "@/lib/i18n";
+import { startListener, closeListenerOnPageHide, enqueueSend, pendingSend, store } from "@/lib/transfers";
 import { installTestHooks, queryAutomation, recordError, testState } from "@/lib/testhooks";
 import { sha256Hex } from "@/lib/runtime";
 import { startWasmLoad, useWasm } from "@/lib/wasm";
@@ -19,10 +20,29 @@ import { startWasmLoad, useWasm } from "@/lib/wasm";
 installTestHooks();
 
 const wasm = useWasm();
+const { locale, setLocale, t } = useI18n();
 const mode = ref<"receive" | "send">("receive");
 const startupError = ref<string | null>(null);
+const seenIncoming = ref(0);
 
 const wasmReady = computed(() => wasm.status.kind === "ready");
+
+const incomingTotal = computed(
+  () => store.transfers.filter((transfer) => transfer.direction === "receive").length,
+);
+const unseenIncoming = computed(() =>
+  mode.value === "receive" ? 0 : Math.max(0, incomingTotal.value - seenIncoming.value),
+);
+watch(mode, (value) => {
+  if (value === "receive") seenIncoming.value = incomingTotal.value;
+});
+
+watch(
+  () => store.listener.kind,
+  (kind) => {
+    document.title = kind === "listening" ? "● etcat" : "etcat";
+  },
+);
 
 const loadPercent = computed(() =>
   wasm.status.kind === "loading"
@@ -31,6 +51,10 @@ const loadPercent = computed(() =>
       ? 100
       : 0,
 );
+
+
+
+
 
 function randomPayload(size: number): Uint8Array {
   if (!Number.isSafeInteger(size) || size < 0) {
@@ -103,7 +127,15 @@ watch(wasmReady, (ready) => {
 
 <template>
   <main class="mx-auto min-h-screen w-full max-w-xl px-4 py-10 sm:py-16">
-    <header class="mb-8 text-center">
+    <header class="relative mb-8 text-center">
+      <button
+        type="button"
+        class="absolute top-0 right-0 inline-flex items-center gap-1 rounded-lg border border-edge px-2 py-1 text-xs text-slate-500 transition hover:border-accent/50 hover:text-accent"
+        @click="setLocale(locale === 'zh' ? 'en' : 'zh')"
+      >
+        <Languages class="size-3.5" />
+        {{ locale === "zh" ? "EN" : "中文" }}
+      </button>
       <div class="mb-2 inline-flex items-center gap-2">
         <span
           class="bg-gradient-to-r from-accent to-glow bg-clip-text font-mono text-3xl font-bold tracking-tight text-transparent"
@@ -112,11 +144,11 @@ watch(wasmReady, (ready) => {
         </span>
       </div>
       <p class="text-sm text-slate-500">
-        Peer-to-peer file &amp; text transfer, right in your browser
+        {{ t("app.subtitle") }}
       </p>
       <p class="mt-2 inline-flex items-center gap-1.5 text-xs text-slate-600">
         <ShieldCheck class="size-3.5 text-accent/70" />
-        End-to-end encrypted via EasyTier — relays never see your data
+        {{ t("app.encrypted") }}
       </p>
     </header>
 
@@ -125,7 +157,7 @@ watch(wasmReady, (ready) => {
       class="rounded-xl border border-edge bg-panel/80 p-4"
     >
       <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
-        <span>Loading WebAssembly runtime…</span>
+        <span>{{ t("app.loading") }}</span>
         <span class="tabular-nums">{{ loadPercent }}%</span>
       </div>
       <div class="h-1.5 overflow-hidden rounded-full bg-edge">
@@ -140,7 +172,7 @@ watch(wasmReady, (ready) => {
       v-else-if="wasm.status.kind === 'failed'"
       class="rounded-xl border border-rose-400/30 bg-rose-500/10 p-4 text-sm text-rose-300"
     >
-      Failed to load the WebAssembly runtime: {{ wasm.status.message }}
+      {{ t("app.loadFailed") }}: {{ wasm.status.message }}
     </div>
 
     <template v-else>
@@ -157,17 +189,23 @@ watch(wasmReady, (ready) => {
         >
           <TabsTrigger
             value="receive"
-            class="inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-slate-400 transition data-[state=active]:bg-accent/15 data-[state=active]:text-accent"
+            class="relative inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-slate-400 transition data-[state=active]:bg-accent/15 data-[state=active]:text-accent"
           >
             <Download class="size-4" />
-            Receive
+            {{ t("tab.receive") }}
+            <span
+              v-if="unseenIncoming > 0"
+              class="absolute -top-1 -right-1 inline-flex size-4 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-void"
+            >
+              {{ unseenIncoming }}
+            </span>
           </TabsTrigger>
           <TabsTrigger
             value="send"
             class="inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-slate-400 transition data-[state=active]:bg-accent/15 data-[state=active]:text-accent"
           >
             <Upload class="size-4" />
-            Send
+            {{ t("tab.send") }}
           </TabsTrigger>
         </TabsList>
         <TabsContent value="receive">
