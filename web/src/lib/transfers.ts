@@ -592,19 +592,39 @@ function handleIncoming(
 function sniffMime(head: Uint8Array): string | null {
   if (head.byteLength < 4) return null;
   const b = head;
+  // Images
   if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
   if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
   if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "image/gif";
+  if (b[0] === 0x42 && b[1] === 0x4d) return "image/bmp";
+  if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return "image/x-icon";
   if (
     b.byteLength >= 12 &&
     b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
     b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50
   ) return "image/webp";
+  // AVIF: ftyp box with brand avif/avis
+  if (
+    b.byteLength >= 12 &&
+    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70 &&
+    b[8] === 0x61 && b[9] === 0x76 && b[10] === 0x69
+  ) return "image/avif";
+  // Documents
   if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return "application/pdf";
+  // Video / audio
   if (
     b.byteLength >= 8 &&
-    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70
+    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70 &&
+    !(b[8] === 0x61 && b[9] === 0x76 && b[10] === 0x69)
   ) return "video/mp4";
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return "video/webm";
+  if (b[0] === 0x4f && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return "audio/ogg";
+  if (b[0] === 0x66 && b[1] === 0x4c && b[2] === 0x61 && b[3] === 0x43) return "audio/flac";
+  if (
+    b.byteLength >= 12 &&
+    b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+    b[8] === 0x57 && b[9] === 0x41 && b[10] === 0x56 && b[11] === 0x45
+  ) return "audio/wav";
   if (
     (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) ||
     (b[0] === 0xff && (b[1] === 0xfb || b[1] === 0xf3 || b[1] === 0xf2))
@@ -617,14 +637,13 @@ function presentReceivedPayload(
   chunks: Uint8Array[],
   total: number,
 ): void {
-  // Text sniffing runs only when the header did not identify a file.
   const head = joinHead(chunks, Math.min(16, chunks.reduce((sum, c) => sum + c.byteLength, 0)));
   const sniffedMime = transfer.mime ?? sniffMime(head);
 
   const headerIdentifiedFile = transfer.kind === "file" && transfer.name !== null;
   if (!headerIdentifiedFile && sniffedMime === null && total <= MAX_TEXT_SNIFF_BYTES) {
     // Cheap NUL/control-byte sample first, then a strict UTF-8 decode.
-    const sample = head.subarray(0, 8192);
+    const sample = joinHead(chunks, Math.min(8192, total));
     let looksBinary = false;
     for (const byte of sample) {
       if (byte === 0) {
@@ -633,17 +652,32 @@ function presentReceivedPayload(
       }
     }
     if (!looksBinary) {
-      const bytes = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
+      const bytes = joinHead(chunks, total);
       try {
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         transfer.kind = "text";
-        transfer.mime = "text/plain;charset=utf-8";
         transfer.receivedText = text;
+        // Upgrade recognizable text formats so the card can render them.
+        const trimmed = text.trimStart();
+        if (/^<svg[\s>]/i.test(trimmed) || /^<\?xml[\s\S]{0,200}?<svg[\s>]/i.test(trimmed)) {
+          transfer.mime = "image/svg+xml";
+        } else if (transfer.name?.endsWith(".md") || transfer.name?.endsWith(".markdown")) {
+          transfer.mime = "text/markdown";
+        } else if (
+          (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+          (trimmed.startsWith("[") && trimmed.endsWith("]"))
+        ) {
+          try {
+            JSON.parse(trimmed);
+            transfer.mime = "application/json";
+          } catch {
+            transfer.mime = "text/plain;charset=utf-8";
+          }
+        } else if (transfer.name?.endsWith(".csv") && trimmed.includes(",")) {
+          transfer.mime = "text/csv";
+        } else {
+          transfer.mime = "text/plain;charset=utf-8";
+        }
         return;
       } catch {
         // Not valid UTF-8; fall through to file presentation.
@@ -656,6 +690,25 @@ function presentReceivedPayload(
     type: transfer.mime ?? "application/octet-stream",
   });
   transfer.downloadUrl = URL.createObjectURL(transfer.blob);
+
+  // Text-ish payloads (JSON, CSV, Markdown, SVG, other text/*) get their
+  // content decoded for the rich preview even when they arrived as files.
+  const mime = transfer.mime ?? "";
+  const textish =
+    mime === "application/json" ||
+    mime === "text/csv" ||
+    mime === "text/markdown" ||
+    mime === "image/svg+xml" ||
+    mime.startsWith("text/");
+  if (textish && total <= MAX_TEXT_SNIFF_BYTES) {
+    try {
+      transfer.receivedText = new TextDecoder("utf-8", { fatal: true }).decode(
+        joinHead(chunks, total),
+      );
+    } catch {
+      // Not valid UTF-8; leave the file-only presentation.
+    }
+  }
 }
 
 /**

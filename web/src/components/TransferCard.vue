@@ -9,13 +9,13 @@ import {
 } from "@/lib/transfers";
 import {
   CheckCircle2,
-  Copy,
   Download,
   Loader2,
   RotateCcw,
   X,
   XCircle,
 } from "lucide-vue-next";
+import RichTextPreview from "./RichTextPreview.vue";
 
 const props = defineProps<{ transfer: Transfer }>();
 const { t } = useI18n();
@@ -35,6 +35,7 @@ const previewKind = computed<"image" | "video" | "audio" | "pdf" | null>(() => {
 
 const previewUrl = computed(() => props.transfer.downloadUrl);
 const previewOpen = ref(false);
+
 const ticker = setInterval(() => {
   now.value = Date.now();
 }, 1000);
@@ -96,15 +97,6 @@ const displayError = computed(() => {
   return error;
 });
 
-const copiedText = ref(false);
-async function copyReceivedText(): Promise<void> {
-  if (props.transfer.receivedText === null) return;
-  await navigator.clipboard.writeText(props.transfer.receivedText);
-  copiedText.value = true;
-  setTimeout(() => {
-    copiedText.value = false;
-  }, 1600);
-}
 
 const saving = ref(false);
 async function save(): Promise<void> {
@@ -166,8 +158,8 @@ async function save(): Promise<void> {
       <div v-else class="progress-indeterminate h-full w-full rounded-full" />
     </div>
 
-    <div v-if="displayError !== null" class="mt-2.5 text-sm text-rose-400">
-      {{ displayError }}
+    <div v-if="transfer.receivedText !== null" class="mt-4">
+      <RichTextPreview :transfer="transfer" />
     </div>
 
     <div v-if="transfer.status === 'failed' && transfer.retry !== null" class="mt-4">
@@ -177,17 +169,9 @@ async function save(): Promise<void> {
       </button>
     </div>
 
-    <div v-if="transfer.receivedText !== null" class="mt-4">
-      <pre class="nice-scroll max-h-56 overflow-auto rounded-xl bg-black/40 p-4 font-mono text-sm text-slate-300 whitespace-pre-wrap">{{ transfer.receivedText }}</pre>
-      <button type="button" class="btn-ghost mt-3" @click="copyReceivedText">
-        <Copy class="size-4" />
-        {{ copiedText ? t("transfer.textCopied") : t("transfer.copyText") }}
-      </button>
-    </div>
-
     <!-- Inline previews for received files -->
     <div
-      v-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done' && previewKind === 'image' && previewUrl !== null"
+      v-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done' && previewKind === 'image' && previewUrl !== null && transfer.receivedText === null"
       class="mt-4"
     >
       <img
