@@ -9,7 +9,9 @@ const { locale, setLocale, t } = useI18n();
 const statusText = computed(() => {
   switch (store.listener.kind) {
     case "listening":
-      return t("receive.listening");
+      return store.listener.relayReady
+        ? t("receive.listening")
+        : t("receive.connecting");
     case "starting":
       return t("receive.starting");
     case "failed":
@@ -18,6 +20,10 @@ const statusText = computed(() => {
       return null;
   }
 });
+
+const statusReady = computed(
+  () => store.listener.kind === "listening" && store.listener.relayReady,
+);
 </script>
 
 <template>
@@ -36,7 +42,7 @@ const statusText = computed(() => {
     <div
       v-if="statusText !== null"
       class="flex items-center gap-2 rounded-full border border-edge px-3 py-1 text-xs"
-      :class="store.listener.kind === 'listening' ? 'text-emerald-300' : 'text-amber-300'"
+      :class="statusReady ? 'text-emerald-300' : 'text-amber-300'"
     >
       <span
         class="pulse-dot inline-block size-1.5 rounded-full"

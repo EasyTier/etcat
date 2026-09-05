@@ -1,15 +1,11 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Radio, Trash2 } from "lucide-vue-next";
+import { Inbox, Radio } from "lucide-vue-next";
 import TokenCard from "./TokenCard.vue";
 import TransferCard from "./TransferCard.vue";
+import TransferRow from "./TransferRow.vue";
 import { useI18n } from "@/lib/i18n";
-import {
-  clearFinishedTransfers,
-  startListener,
-  stopListener,
-  store,
-} from "@/lib/transfers";
+import { startListener, stopListener, store } from "@/lib/transfers";
 import { useWasm } from "@/lib/wasm";
 
 const wasm = useWasm();
@@ -18,11 +14,24 @@ const { t } = useI18n();
 const incoming = computed(() =>
   store.transfers.filter((transfer) => transfer.direction === "receive"),
 );
-const finishedCount = computed(
-  () =>
-    store.transfers.filter(
-      (transfer) => transfer.status === "done" || transfer.status === "failed",
-    ).length,
+const spotlight = computed(() =>
+  incoming.value.find(
+    (transfer) =>
+      transfer.status === "connecting" ||
+      transfer.status === "transferring" ||
+      transfer.status === "confirming",
+  ),
+);
+const latest = computed(() =>
+  incoming.value.find(
+    (transfer) => transfer.status === "done" || transfer.status === "failed",
+  ),
+);
+const history = computed(() =>
+  incoming.value.filter(
+    (transfer) =>
+      transfer !== spotlight.value && transfer !== latest.value,
+  ),
 );
 
 const listening = computed(() => store.listener.kind === "listening");
@@ -62,7 +71,14 @@ async function start(): Promise<void> {
     <template v-else>
       <TokenCard />
       <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2 text-sm text-emerald-300">
+        <div
+          v-if="store.listener.kind === 'listening' && !store.listener.relayReady"
+          class="flex items-center gap-2 text-sm text-amber-300"
+        >
+          <span class="pulse-dot inline-block size-2 rounded-full bg-amber-300" />
+          {{ t("receive.connecting") }}
+        </div>
+        <div v-else class="flex items-center gap-2 text-sm text-emerald-300">
           <span class="pulse-dot inline-block size-2 rounded-full bg-emerald-400" />
           {{ t("receive.listening") }}
         </div>
@@ -76,19 +92,24 @@ async function start(): Promise<void> {
       </div>
     </template>
 
-    <div v-if="incoming.length > 0" class="space-y-4">
-      <div v-if="finishedCount > 1" class="flex justify-end">
-        <button
-          type="button"
-          class="inline-flex items-center gap-1.5 text-sm text-slate-500 transition hover:text-slate-300"
-          @click="clearFinishedTransfers"
-        >
-          <Trash2 class="size-3.5" />
-          {{ t("transfer.clearDone") }}
-        </button>
+    <!-- Spotlight: the transfer that matters right now -->
+    <TransferCard v-if="spotlight" :transfer="spotlight" />
+    <TransferCard v-else-if="latest" :transfer="latest" />
+
+    <div
+      v-else-if="listening"
+      class="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-edge py-14 text-slate-600"
+    >
+      <Inbox class="size-8" />
+      <span class="text-sm">{{ t("timeline.empty") }}</span>
+    </div>
+
+    <div v-if="history.length > 0" class="space-y-0.5">
+      <div class="px-3 pb-1 text-xs font-medium tracking-widest text-slate-600 uppercase">
+        {{ t("timeline.earlier") }}
       </div>
-      <TransferCard
-        v-for="transfer in incoming"
+      <TransferRow
+        v-for="transfer in history"
         :key="transfer.id"
         :transfer="transfer"
       />

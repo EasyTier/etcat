@@ -32,7 +32,7 @@ const bufferedBytes = computed(() =>
 
 <template>
   <aside
-    class="flex w-60 shrink-0 flex-col border-r border-edge bg-panel/50 backdrop-blur-xl"
+    class="hidden w-60 shrink-0 flex-col border-r border-edge bg-panel/50 backdrop-blur-xl md:flex"
   >
     <nav class="flex-1 space-y-1 overflow-y-auto p-3">
       <div class="px-3 pb-2 text-xs font-semibold tracking-widest text-slate-600 uppercase">

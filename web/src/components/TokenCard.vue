@@ -24,16 +24,21 @@ const shareLink = computed(() => {
 const qrDataUrl = ref<string | null>(null);
 watch(
   shareLink,
-  async (link) => {
+  async (link, _old, onCleanup) => {
     if (link === null) {
       qrDataUrl.value = null;
       return;
     }
-    qrDataUrl.value = await QRCode.toDataURL(link, {
-      margin: 1,
-      width: 240,
-      color: { dark: "#e2f6fc", light: "#00000000" },
+    let stale = false;
+    onCleanup(() => {
+      stale = true;
+    });
+    const dataUrl = await QRCode.toDataURL(link, {
+      margin: 2,
+      width: 256,
+      color: { dark: "#0b101b", light: "#e2f6fc" },
     }).catch(() => null);
+    if (!stale) qrDataUrl.value = dataUrl;
   },
   { immediate: true },
 );

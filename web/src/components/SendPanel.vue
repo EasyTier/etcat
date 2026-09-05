@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import { FileUp, SendHorizontal, X } from "lucide-vue-next";
 import TransferCard from "./TransferCard.vue";
+import TransferRow from "./TransferRow.vue";
 import { formatBytes } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { enqueueSend, pendingSend, store } from "@/lib/transfers";
@@ -18,6 +19,25 @@ const fileInput = ref<HTMLInputElement | null>(null);
 
 const outgoing = computed(() =>
   store.transfers.filter((transfer) => transfer.direction === "send"),
+);
+const spotlight = computed(() =>
+  outgoing.value.find(
+    (transfer) =>
+      transfer.status === "connecting" ||
+      transfer.status === "transferring" ||
+      transfer.status === "confirming",
+  ),
+);
+const latest = computed(() =>
+  outgoing.value.find(
+    (transfer) => transfer.status === "done" || transfer.status === "failed",
+  ),
+);
+const history = computed(() =>
+  outgoing.value.filter(
+    (transfer) =>
+      transfer !== spotlight.value && transfer !== latest.value,
+  ),
 );
 
 const tokenInvalid = computed(() => {
@@ -176,9 +196,15 @@ async function send(): Promise<void> {
       {{ sending ? t("send.sending") : file !== null ? t("send.sendFile") : t("send.sendText") }}
     </button>
 
-    <div v-if="outgoing.length > 0" class="space-y-4">
-      <TransferCard
-        v-for="transfer in outgoing"
+    <TransferCard v-if="spotlight" :transfer="spotlight" />
+    <TransferCard v-else-if="latest" :transfer="latest" />
+
+    <div v-if="history.length > 0" class="space-y-0.5">
+      <div class="px-3 pb-1 text-xs font-medium tracking-widest text-slate-600 uppercase">
+        {{ t("timeline.earlier") }}
+      </div>
+      <TransferRow
+        v-for="transfer in history"
         :key="transfer.id"
         :transfer="transfer"
       />

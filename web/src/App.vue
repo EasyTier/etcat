@@ -183,6 +183,7 @@ watch(wasmReady, (ready) => {
       <div
         class="fixed inset-y-0 right-0 z-50 w-80 transform border-l border-edge bg-panel shadow-2xl transition-transform duration-300"
         :class="settingsOpen ? 'translate-x-0' : 'translate-x-full'"
+        :inert="!settingsOpen"
       >
         <div class="flex items-center justify-between border-b border-edge px-5 py-4">
           <span class="text-sm font-semibold text-slate-200">{{ t("advanced.title") }}</span>
