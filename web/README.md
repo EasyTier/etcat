@@ -33,6 +33,19 @@ The page must be served over HTTPS or `localhost` (WebCrypto requirement).
 HTTPS pages can only reach `wss://` relays; the default `community-1` relay
 ships a publicly trusted WSS endpoint, so no configuration is needed.
 
+## Troubleshooting
+
+- **"Timed out" on every send**: you are almost certainly running a stale
+  build. Run `pnpm build` again and hard-refresh (`Ctrl+Shift+R`) — the
+  current version retries relay route sync for 30 s instead of failing after
+  a single 5 s attempt.
+- **Nothing connects on an HTTPS deployment**: the relay must be `wss://`.
+  The default `community-1` already is; a custom `ws://` relay only works on
+  `http://localhost` pages.
+- **Relay unreachable at all**: check the browser console for
+  `connect_error` events and try `?relay=wss://<your-relay>` once to isolate
+  the community relay from your network path.
+
 ## Runtime vendoring
 
 The EasyTier browser runtime is vendored, not published as a package:
