@@ -110,15 +110,13 @@ async function save(): Promise<void> {
 </script>
 
 <template>
-  <div
-    class="rounded-xl border border-edge bg-panel/80 p-4 shadow-lg shadow-black/20"
-  >
+  <div class="card-glow animate-rise rounded-2xl p-5">
     <div class="flex items-start justify-between gap-3">
       <div class="min-w-0">
-        <div class="truncate text-sm font-medium text-slate-100">
+        <div class="truncate text-base font-medium text-slate-100">
           {{ title }}
         </div>
-        <div class="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
+        <div class="mt-1 flex items-center gap-2 text-sm text-slate-500">
           <span class="tabular-nums">{{ formatBytes(transfer.bytes) }}</span>
           <template v-if="transfer.size !== null">
             <span aria-hidden="true">/</span>
@@ -129,58 +127,47 @@ async function save(): Promise<void> {
         </div>
       </div>
       <div class="flex shrink-0 items-center gap-1">
-        <Loader2 v-if="active" class="size-4 animate-spin text-accent" />
+        <Loader2 v-if="active" class="size-4.5 animate-spin text-accent" />
         <CheckCircle2
           v-else-if="transfer.status === 'done'"
-          class="size-4 text-emerald-400"
+          class="size-4.5 text-emerald-400"
         />
-        <XCircle v-else class="size-4 text-rose-400" />
+        <XCircle v-else class="size-4.5 text-rose-400" />
         <button
           v-if="!active"
           type="button"
           :title="t('transfer.remove')"
-          class="rounded p-1 text-slate-600 transition hover:bg-white/5 hover:text-slate-300"
+          class="rounded-lg p-1.5 text-slate-600 transition hover:bg-white/5 hover:text-slate-300"
           @click="removeTransfer(transfer.id)"
         >
-          <X class="size-3.5" />
+          <X class="size-4" />
         </button>
       </div>
     </div>
 
-    <div
-      v-if="active"
-      class="mt-3 h-1.5 overflow-hidden rounded-full bg-edge"
-    >
+    <div v-if="active" class="mt-4 h-2 overflow-hidden rounded-full bg-edge">
       <div
         v-if="progress !== null"
-        class="h-full rounded-full bg-gradient-to-r from-accent to-glow transition-[width] duration-300"
+        class="h-full rounded-full bg-gradient-to-r from-accent to-glow shadow-[0_0_12px_rgb(34_211_238/0.5)] transition-[width] duration-300"
         :style="{ width: `${(progress * 100).toFixed(1)}%` }"
       />
       <div v-else class="progress-indeterminate h-full w-full rounded-full" />
     </div>
 
-    <div v-if="displayError !== null" class="mt-2 text-xs text-rose-400">
+    <div v-if="displayError !== null" class="mt-2.5 text-sm text-rose-400">
       {{ displayError }}
     </div>
 
-    <div v-if="transfer.status === 'failed' && transfer.retry !== null" class="mt-3">
-      <button
-        type="button"
-        class="inline-flex items-center gap-1.5 rounded-lg border border-edge px-3 py-1.5 text-sm text-slate-300 transition hover:border-accent/50 hover:text-accent"
-        @click="transfer.retry?.()"
-      >
+    <div v-if="transfer.status === 'failed' && transfer.retry !== null" class="mt-4">
+      <button type="button" class="btn-ghost" @click="transfer.retry?.()">
         <RotateCcw class="size-4" />
         {{ t("transfer.retry") }}
       </button>
     </div>
 
-    <div v-if="transfer.receivedText !== null" class="mt-3">
-      <pre class="nice-scroll max-h-48 overflow-auto rounded-lg bg-black/40 p-3 font-mono text-xs text-slate-300 whitespace-pre-wrap">{{ transfer.receivedText }}</pre>
-      <button
-        type="button"
-        class="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-edge px-3 py-1.5 text-sm text-slate-300 transition hover:border-accent/50 hover:text-accent"
-        @click="copyReceivedText"
-      >
+    <div v-if="transfer.receivedText !== null" class="mt-4">
+      <pre class="nice-scroll max-h-56 overflow-auto rounded-xl bg-black/40 p-4 font-mono text-sm text-slate-300 whitespace-pre-wrap">{{ transfer.receivedText }}</pre>
+      <button type="button" class="btn-ghost mt-3" @click="copyReceivedText">
         <Copy class="size-4" />
         {{ copiedText ? t("transfer.textCopied") : t("transfer.copyText") }}
       </button>
@@ -188,12 +175,12 @@ async function save(): Promise<void> {
 
     <div
       v-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done'"
-      class="mt-3"
+      class="mt-4"
     >
       <button
         type="button"
         :disabled="saving"
-        class="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-void transition hover:bg-cyan-300 disabled:opacity-50"
+        class="btn-primary !h-11 !px-5 !text-sm"
         @click="save"
       >
         <Download class="size-4" />

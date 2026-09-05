@@ -1,14 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { Download, Languages, ShieldCheck, Upload } from "lucide-vue-next";
-import {
-  TabsContent,
-  TabsList,
-  TabsRoot,
-  TabsTrigger,
-} from "reka-ui";
+import { ShieldCheck } from "lucide-vue-next";
+import TopBar from "./components/TopBar.vue";
+import SideNav from "./components/SideNav.vue";
+import ModeCards from "./components/ModeCards.vue";
 import ReceivePanel from "./components/ReceivePanel.vue";
 import SendPanel from "./components/SendPanel.vue";
+import AdvancedSettings from "./components/AdvancedSettings.vue";
 import { useI18n } from "@/lib/i18n";
 import { startListener, closeListenerOnPageHide, enqueueSend, pendingSend, store } from "@/lib/transfers";
 import { installTestHooks, queryAutomation, recordError, testState } from "@/lib/testhooks";
@@ -20,24 +18,12 @@ import { startWasmLoad, useWasm } from "@/lib/wasm";
 installTestHooks();
 
 const wasm = useWasm();
-const { locale, setLocale, t } = useI18n();
+const { t } = useI18n();
 const mode = ref<"receive" | "send">("receive");
 const startupError = ref<string | null>(null);
-const seenIncoming = ref(0);
+const settingsOpen = ref(false);
 
 const wasmReady = computed(() => wasm.status.kind === "ready");
-
-const incomingTotal = computed(
-  () => store.transfers.filter((transfer) => transfer.direction === "receive").length,
-);
-const unseenIncoming = computed(() =>
-  Math.max(0, incomingTotal.value - seenIncoming.value),
-);
-watch([mode, incomingTotal], ([value]) => {
-  // While Receive is active every arrival is seen immediately; on entering the
-  // tab the current total becomes the seen baseline.
-  if (value === "receive") seenIncoming.value = incomingTotal.value;
-});
 
 watch(
   () => store.listener.kind,
@@ -53,10 +39,6 @@ const loadPercent = computed(() =>
       ? 100
       : 0,
 );
-
-
-
-
 
 function randomPayload(size: number): Uint8Array {
   if (!Number.isSafeInteger(size) || size < 0) {
@@ -128,106 +110,94 @@ watch(wasmReady, (ready) => {
 </script>
 
 <template>
-  <main class="mx-auto min-h-screen w-full max-w-xl px-4 py-10 sm:py-16">
-    <header class="relative mb-8 text-center">
-      <button
-        type="button"
-        class="absolute top-0 right-0 inline-flex items-center gap-1 rounded-lg border border-edge px-2 py-1 text-xs text-slate-500 transition hover:border-accent/50 hover:text-accent"
-        @click="setLocale(locale === 'zh' ? 'en' : 'zh')"
-      >
-        <Languages class="size-3.5" />
-        {{ locale === "zh" ? "EN" : "中文" }}
-      </button>
-      <div class="mb-2 inline-flex items-center gap-2">
-        <span
-          class="bg-gradient-to-r from-accent to-glow bg-clip-text font-mono text-3xl font-bold tracking-tight text-transparent"
-        >
-          etcat
-        </span>
-      </div>
-      <p class="text-sm text-slate-500">
-        {{ t("app.subtitle") }}
-      </p>
-      <p class="mt-2 inline-flex items-center gap-1.5 text-xs text-slate-600">
-        <ShieldCheck class="size-3.5 text-accent/70" />
-        {{ t("app.encrypted") }}
-      </p>
-    </header>
+  <div class="flex h-screen flex-col">
+    <TopBar />
+    <div class="flex min-h-0 flex-1">
+      <SideNav @open-settings="settingsOpen = true" />
 
-    <div
-      v-if="wasm.status.kind === 'loading'"
-      class="rounded-xl border border-edge bg-panel/80 p-4"
-    >
-      <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
-        <span>{{ t("app.loading") }}</span>
-        <span class="tabular-nums">{{ loadPercent }}%</span>
-      </div>
-      <div class="h-1.5 overflow-hidden rounded-full bg-edge">
-        <div
-          class="h-full rounded-full bg-gradient-to-r from-accent to-glow transition-[width] duration-200"
-          :style="{ width: `${loadPercent}%` }"
-        />
-      </div>
-    </div>
-
-    <div
-      v-else-if="wasm.status.kind === 'failed'"
-      class="rounded-xl border border-rose-400/30 bg-rose-500/10 p-4 text-sm text-rose-300"
-    >
-      {{ t("app.loadFailed") }}: {{ wasm.status.message }}
-    </div>
-
-    <template v-else>
-      <div
-        v-if="startupError !== null"
-        class="mb-4 rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
-      >
-        {{ startupError }}
-      </div>
-
-      <TabsRoot v-model="mode">
-        <TabsList
-          class="mb-5 grid grid-cols-2 gap-1 rounded-xl border border-edge bg-panel/60 p-1"
-        >
-          <TabsTrigger
-            value="receive"
-            class="relative inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-slate-400 transition data-[state=active]:bg-accent/15 data-[state=active]:text-accent"
+      <main class="nice-scroll min-w-0 flex-1 overflow-y-auto">
+        <div class="mx-auto max-w-3xl px-6 py-10">
+          <div
+            v-if="wasm.status.kind === 'loading'"
+            class="card-glow animate-rise rounded-2xl p-6"
           >
-            <Download class="size-4" />
-            {{ t("tab.receive") }}
-            <span
-              v-if="unseenIncoming > 0"
-              class="absolute -top-1 -right-1 inline-flex size-4 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-void"
+            <div class="mb-3 flex items-center justify-between text-sm text-slate-400">
+              <span>{{ t("app.loading") }}</span>
+              <span class="tabular-nums">{{ loadPercent }}%</span>
+            </div>
+            <div class="h-2 overflow-hidden rounded-full bg-edge">
+              <div
+                class="h-full rounded-full bg-gradient-to-r from-accent to-glow transition-[width] duration-200"
+                :style="{ width: `${loadPercent}%` }"
+              />
+            </div>
+          </div>
+
+          <div
+            v-else-if="wasm.status.kind === 'failed'"
+            class="rounded-2xl border border-rose-400/30 bg-rose-500/10 p-5 text-sm text-rose-300"
+          >
+            {{ t("app.loadFailed") }}: {{ wasm.status.message }}
+          </div>
+
+          <template v-else>
+            <div
+              v-if="startupError !== null"
+              class="mb-4 rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300"
             >
-              {{ unseenIncoming }}
-            </span>
-          </TabsTrigger>
-          <TabsTrigger
-            value="send"
-            class="inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-slate-400 transition data-[state=active]:bg-accent/15 data-[state=active]:text-accent"
-          >
-            <Upload class="size-4" />
-            {{ t("tab.send") }}
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="receive">
-          <ReceivePanel />
-        </TabsContent>
-        <TabsContent value="send">
-          <SendPanel />
-        </TabsContent>
-      </TabsRoot>
-    </template>
+              {{ startupError }}
+            </div>
 
-    <footer class="mt-10 text-center text-xs text-slate-600">
-      <a
-        href="https://github.com/EasyTier/etcat"
-        class="transition hover:text-slate-400"
-        target="_blank"
-        rel="noopener"
+            <ModeCards v-model="mode" />
+
+            <div class="mt-6">
+              <ReceivePanel v-show="mode === 'receive'" />
+              <SendPanel v-show="mode === 'send'" />
+            </div>
+          </template>
+
+          <footer class="mt-14 flex items-center justify-center gap-2 text-xs text-slate-600">
+            <ShieldCheck class="size-3.5 text-accent/60" />
+            {{ t("app.encrypted") }}
+            <span aria-hidden="true">·</span>
+            <a
+              href="https://github.com/EasyTier/etcat"
+              class="transition hover:text-slate-400"
+              target="_blank"
+              rel="noopener"
+            >
+              github.com/EasyTier/etcat
+            </a>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <!-- Settings drawer -->
+    <Teleport to="body">
+      <div
+        v-if="settingsOpen"
+        class="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm"
+        @click="settingsOpen = false"
+      />
+      <div
+        class="fixed inset-y-0 right-0 z-50 w-80 transform border-l border-edge bg-panel shadow-2xl transition-transform duration-300"
+        :class="settingsOpen ? 'translate-x-0' : 'translate-x-full'"
       >
-        github.com/EasyTier/etcat
-      </a>
-    </footer>
-  </main>
+        <div class="flex items-center justify-between border-b border-edge px-5 py-4">
+          <span class="text-sm font-semibold text-slate-200">{{ t("advanced.title") }}</span>
+          <button
+            type="button"
+            class="rounded-lg p-1.5 text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
+            @click="settingsOpen = false"
+          >
+            ✕
+          </button>
+        </div>
+        <div class="p-5">
+          <AdvancedSettings bare />
+        </div>
+      </div>
+    </Teleport>
+  </div>
 </template>

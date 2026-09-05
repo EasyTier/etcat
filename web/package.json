@@ -11,17 +11,21 @@
     "sync:runtime": "node scripts/sync-runtime.mjs"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
     "lucide-vue-next": "^0.545.0",
+    "qrcode": "^1.5.4",
     "reka-ui": "^2.5.1",
     "vue": "^3.5.18"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.12",
+    "@types/node": "^22.18.1",
+    "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-vue": "^6.0.1",
     "tailwindcss": "^4.1.12",
     "typescript": "^5.9.3",
     "vite": "^7.1.5",
-    "@types/node": "^22.18.1",
     "vue-tsc": "^3.0.7"
   }
 }

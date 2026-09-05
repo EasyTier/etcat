@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { FileUp, SendHorizontal, Type, X } from "lucide-vue-next";
+import { FileUp, SendHorizontal, X } from "lucide-vue-next";
 import TransferCard from "./TransferCard.vue";
 import { formatBytes } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
@@ -20,7 +20,6 @@ const outgoing = computed(() =>
   store.transfers.filter((transfer) => transfer.direction === "send"),
 );
 
-/** Accepts a bare etc2 token or a pasted share link carrying ?token=. */
 const tokenInvalid = computed(() => {
   const value = pendingSend.token.trim();
   if (value.length === 0) return false;
@@ -28,7 +27,6 @@ const tokenInvalid = computed(() => {
   try {
     const url = new URL(value);
     const token = url.searchParams.get("token");
-    // A link is only valid if it actually carries an etc2 token.
     return token === null || !token.startsWith("etc2");
   } catch {
     return true;
@@ -89,74 +87,74 @@ async function send(): Promise<void> {
 </script>
 
 <template>
-  <div class="space-y-4">
-    <label class="block text-sm text-slate-400">
-      {{ t("send.tokenLabel") }}
+  <div class="space-y-5">
+    <div>
+      <label class="mb-1.5 block text-sm font-medium text-slate-300">
+        {{ t("send.tokenLabel") }}
+      </label>
       <input
         v-model="pendingSend.token"
         type="text"
         autocomplete="off"
         spellcheck="false"
         :placeholder="t('send.tokenPlaceholder')"
-        class="mt-1.5 w-full rounded-lg border bg-black/30 px-3 py-2.5 font-mono text-sm text-slate-200 outline-none transition placeholder:text-slate-600"
+        class="w-full rounded-xl border bg-black/30 px-4 py-3 font-mono text-sm text-slate-200 outline-none transition placeholder:text-slate-600"
         :class="
           tokenInvalid
             ? 'border-rose-400/60 focus:border-rose-400'
             : 'border-edge focus:border-accent/60'
         "
       />
-      <span v-if="tokenInvalid" class="mt-1 block text-xs text-rose-400">
+      <p v-if="tokenInvalid" class="mt-1.5 text-xs text-rose-400">
         {{ t("send.tokenInvalid") }}
-      </span>
-    </label>
+      </p>
+    </div>
 
     <div
-      class="relative rounded-xl border-2 border-dashed transition"
+      class="relative rounded-2xl border-2 border-dashed transition"
       :class="
         dragging
           ? 'border-accent bg-accent/10'
-          : 'border-edge bg-panel/60 hover:border-slate-600'
+          : 'border-edge bg-panel/40 hover:border-slate-600'
       "
       @dragover.prevent="dragging = true"
       @dragleave.prevent="dragging = false"
       @drop.prevent="onDrop"
     >
-      <input
-        ref="fileInput"
-        type="file"
-        class="hidden"
-        @change="onFileChange"
-      />
-      <div v-if="file !== null" class="flex items-center gap-2 px-4 py-4">
+      <input ref="fileInput" type="file" class="hidden" @change="onFileChange" />
+      <div v-if="file !== null" class="flex items-center gap-3 p-5">
         <span
-          class="inline-flex min-w-0 items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-sm text-slate-200"
+          class="inline-flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3"
         >
-          <FileUp class="size-4 shrink-0 text-accent" />
-          <span class="truncate">{{ file.name }}</span>
-          <span class="shrink-0 text-xs text-slate-500">({{ formatBytes(file.size) }})</span>
+          <FileUp class="size-5 shrink-0 text-accent" />
+          <span class="truncate text-sm font-medium text-slate-100">{{ file.name }}</span>
+          <span class="shrink-0 text-xs text-slate-500">{{ formatBytes(file.size) }}</span>
           <button
             type="button"
-            class="shrink-0 rounded p-0.5 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
+            class="ml-auto shrink-0 rounded-lg p-1.5 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
             @click="file = null"
           >
-            <X class="size-3.5" />
+            <X class="size-4" />
           </button>
         </span>
       </div>
       <button
         v-else
         type="button"
-        class="flex w-full flex-col items-center gap-2 px-4 py-8 text-center"
+        class="flex w-full flex-col items-center gap-3 px-6 py-12 text-center"
         @click="pickFile"
       >
-        <FileUp class="size-8 text-slate-500" />
-        <span class="text-sm text-slate-400">{{ t("send.dropHere") }}</span>
+        <span
+          class="flex size-14 items-center justify-center rounded-2xl bg-gradient-to-br from-accent/20 to-glow/20 text-accent transition group-hover:scale-105"
+        >
+          <FileUp class="size-6" />
+        </span>
+        <span class="text-base text-slate-400">{{ t("send.dropHere") }}</span>
       </button>
     </div>
 
     <div>
-      <label class="mb-1.5 flex items-center gap-1.5 text-sm text-slate-400">
-        <Type class="size-3.5" />
+      <label class="mb-1.5 block text-sm font-medium text-slate-300">
         {{ file !== null ? t("send.fileSelected") : t("send.orText") }}
       </label>
       <textarea
@@ -164,21 +162,21 @@ async function send(): Promise<void> {
         rows="3"
         :disabled="file !== null"
         :placeholder="t('send.textPlaceholder')"
-        class="nice-scroll w-full resize-none rounded-lg border border-edge bg-black/30 px-3 py-2.5 text-sm text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-accent/60 disabled:opacity-40"
+        class="nice-scroll w-full resize-none rounded-xl border border-edge bg-black/30 px-4 py-3 text-sm text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-accent/60 disabled:opacity-40"
       />
     </div>
 
     <button
       type="button"
       :disabled="!canSend"
-      class="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-accent px-4 py-3 text-sm font-semibold text-void transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
+      class="btn-primary w-full"
       @click="send"
     >
-      <SendHorizontal class="size-4" />
+      <SendHorizontal class="size-5" />
       {{ sending ? t("send.sending") : file !== null ? t("send.sendFile") : t("send.sendText") }}
     </button>
 
-    <div v-if="outgoing.length > 0" class="space-y-3">
+    <div v-if="outgoing.length > 0" class="space-y-4">
       <TransferCard
         v-for="transfer in outgoing"
         :key="transfer.id"
