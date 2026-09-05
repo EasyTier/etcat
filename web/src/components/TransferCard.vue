@@ -158,6 +158,10 @@ async function save(): Promise<void> {
       <div v-else class="progress-indeterminate h-full w-full rounded-full" />
     </div>
 
+    <div v-if="displayError !== null" class="mt-2.5 text-sm text-rose-400">
+      {{ displayError }}
+    </div>
+
     <div v-if="transfer.receivedText !== null" class="mt-4">
       <RichTextPreview :transfer="transfer" />
     </div>

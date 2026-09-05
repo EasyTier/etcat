@@ -25,6 +25,7 @@ const messages = {
     "timeline.minutesAgo": "m ago",
     "timeline.hoursAgo": "h ago",
     "transfer.previewPdf": "Preview PDF",
+    "transfer.previewTruncated": "Preview truncated — the full file is available via save",
     "tab.receive": "Receive",
     "tab.send": "Send",
 
@@ -109,6 +110,7 @@ const messages = {
     "timeline.justNow": "刚刚",
     "timeline.minutesAgo": " 分钟前",
     "transfer.previewPdf": "预览 PDF",
+    "transfer.previewTruncated": "预览已截断 —— 完整文件可通过保存获得",
     "timeline.hoursAgo": " 小时前",
     "conn.incoming": "传入",
     "conn.outgoing": "传出",

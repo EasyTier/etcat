@@ -603,22 +603,36 @@ function sniffMime(head: Uint8Array): string | null {
     b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
     b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50
   ) return "image/webp";
-  // AVIF: ftyp box with brand avif/avis
-  if (
-    b.byteLength >= 12 &&
-    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70 &&
-    b[8] === 0x61 && b[9] === 0x76 && b[10] === 0x69
-  ) return "image/avif";
+  // AVIF/HEIC share the ISOBMFF ftyp layout with MP4 and distinguishing them
+  // reliably needs the compatible-brands list, which may exceed our sample;
+  // skip rather than misclassify.
   // Documents
   if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return "application/pdf";
   // Video / audio
   if (
     b.byteLength >= 8 &&
-    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70 &&
-    !(b[8] === 0x61 && b[9] === 0x76 && b[10] === 0x69)
+    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70
   ) return "video/mp4";
-  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return "video/webm";
-  if (b[0] === 0x4f && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return "audio/ogg";
+  // EBML (WebM/Matroska): the DocType element (0x4282) distinguishes them.
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) {
+    for (let i = 4; i + 3 < b.byteLength; i++) {
+      if (b[i] === 0x42 && b[i + 1] === 0x82) {
+        const len = b[i + 2]! & 0x7f;
+        const docType = new TextDecoder().decode(b.subarray(i + 3, i + 3 + len));
+        if (docType === "webm") return "video/webm";
+        if (docType === "matroska") return "video/x-matroska";
+        return null;
+      }
+    }
+    return null;
+  }
+  // Ogg container: the first BOS packet identifies the codec.
+  if (b[0] === 0x4f && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) {
+    const ascii = new TextDecoder("latin1").decode(b);
+    if (ascii.includes("\x80theora")) return "video/ogg";
+    if (ascii.includes("vorbis") || ascii.includes("OpusHead")) return "audio/ogg";
+    return null;
+  }
   if (b[0] === 0x66 && b[1] === 0x4c && b[2] === 0x61 && b[3] === 0x43) return "audio/flac";
   if (
     b.byteLength >= 12 &&
@@ -637,7 +651,7 @@ function presentReceivedPayload(
   chunks: Uint8Array[],
   total: number,
 ): void {
-  const head = joinHead(chunks, Math.min(16, chunks.reduce((sum, c) => sum + c.byteLength, 0)));
+  const head = joinHead(chunks, Math.min(64, chunks.reduce((sum, c) => sum + c.byteLength, 0)));
   const sniffedMime = transfer.mime ?? sniffMime(head);
 
   const headerIdentifiedFile = transfer.kind === "file" && transfer.name !== null;
@@ -658,7 +672,7 @@ function presentReceivedPayload(
         transfer.kind = "text";
         transfer.receivedText = text;
         // Upgrade recognizable text formats so the card can render them.
-        const trimmed = text.trimStart();
+        const trimmed = text.trim();
         if (/^<svg[\s>]/i.test(trimmed) || /^<\?xml[\s\S]{0,200}?<svg[\s>]/i.test(trimmed)) {
           transfer.mime = "image/svg+xml";
         } else if (transfer.name?.endsWith(".md") || transfer.name?.endsWith(".markdown")) {
@@ -686,6 +700,21 @@ function presentReceivedPayload(
   }
   transfer.kind = "file";
   transfer.mime = sniffedMime ?? transfer.mime;
+  // Named files whose header MIME is generic still classify by extension.
+  if (
+    (transfer.mime === null || transfer.mime === "application/octet-stream" || transfer.mime === "text/plain") &&
+    transfer.name !== null
+  ) {
+    if (transfer.name.endsWith(".md") || transfer.name.endsWith(".markdown")) {
+      transfer.mime = "text/markdown";
+    } else if (transfer.name.endsWith(".csv")) {
+      transfer.mime = "text/csv";
+    } else if (transfer.name.endsWith(".svg")) {
+      transfer.mime = "image/svg+xml";
+    } else if (transfer.name.endsWith(".json")) {
+      transfer.mime = "application/json";
+    }
+  }
   transfer.blob = new Blob(chunks as unknown as BlobPart[], {
     type: transfer.mime ?? "application/octet-stream",
   });
