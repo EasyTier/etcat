@@ -81,7 +81,7 @@ onMounted(async () => {
       await waitForWasm();
       const data = randomPayload(automation.bytes);
       testState.sentHash = await sha256Hex(data);
-      await enqueueSend(null, "file", data.byteLength, async (offset, length) => {
+      await enqueueSend(null, "file", data.byteLength, null, async (offset, length) => {
         return data.subarray(offset, offset + length);
       }).catch((error: unknown) => {
         startupError.value =

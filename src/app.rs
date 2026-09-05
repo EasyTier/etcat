@@ -757,8 +757,65 @@ async fn handle_stream_connection(
     if destination == Destination::Ping {
         return Ok(false);
     }
+    if destination == (Destination::ServerPort { port: 2 }) {
+        receive_named_file(&mut stream).await?;
+        return Ok(true);
+    }
     copy(&mut stream, &mut tokio::io::stdout()).await?;
     Ok(true)
+}
+
+/// Port-2 file transfers carry a versioned metadata frame:
+///
+/// ```text
+/// [magic: 8B "ETCATF01"]   version lives in the last two digits
+/// [u32le header_len]       header length, capped at 64 KiB
+/// [header: JSON]           self-describing keys; unknown keys are ignored
+/// [payload]                raw bytes until EOF
+/// ```
+///
+/// Receivers route on the magic: anything else is treated as a raw stream,
+/// identical to port 1. Future protocol revisions bump the magic version
+/// (`ETCATF02`, ...) and new header keys are additive, so implementations
+/// never break each other.
+const FILE_FRAME_MAGIC: &[u8; 8] = b"ETCATF01";
+
+async fn receive_named_file(stream: &mut TcpStream) -> Result<()> {
+    const MAX_HEADER_LEN: usize = 64 * 1024;
+
+    let mut magic = [0u8; 8];
+    stream.read_exact(&mut magic).await?;
+    if &magic != FILE_FRAME_MAGIC {
+        // No metadata frame: the magic bytes are payload. Replay them and
+        // continue as a raw stream.
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(&magic).await?;
+        copy(stream, &mut stdout).await?;
+        return Ok(());
+    }
+
+    let header_len = stream.read_u32_le().await? as usize;
+    anyhow::ensure!(header_len <= MAX_HEADER_LEN, "file metadata header too large");
+    let mut header = vec![0u8; header_len];
+    stream.read_exact(&mut header).await?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(&header).context("invalid file metadata")?;
+    let name = meta
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .context("file metadata is missing a name")?;
+    let name = Path::new(name)
+        .file_name()
+        .context("file metadata name is not a file name")?
+        .to_string_lossy()
+        .into_owned();
+    anyhow::ensure!(!name.is_empty() && name.len() <= 255, "invalid file name");
+    let path = std::env::current_dir()?.join(&name);
+    anyhow::ensure!(!path.exists(), "{name} already exists in the working directory");
+    let mut file = tokio::fs::File::create(&path).await?;
+    let written = copy(stream, &mut file).await?;
+    eprintln!("# Received {written} bytes -> {}", path.display());
+    Ok(())
 }
 
 async fn handle_service_connection(

@@ -23,6 +23,13 @@ const RELAY_CONNECT_TIMEOUT_MS = 30_000;
 const STREAM_OPEN_TIMEOUT_MS = 30_000;
 const STREAM_OPEN_ATTEMPT_MS = 5_000;
 
+// Port-2 file transfers carry a versioned metadata frame; see
+// receive_named_file in src/app.rs. The version lives in the last two magic
+// digits, and JSON header keys are additive, so implementations never break
+// each other.
+const FILE_FRAME_MAGIC = new TextEncoder().encode("ETCATF01");
+const FILE_META_PORT = 2;
+
 export type TransferStatus =
   | "connecting"
   | "transferring"
@@ -50,6 +57,8 @@ export interface Transfer {
   retry: (() => void) | null;
   /** Buffered payload of a completed received file, kept for saving. */
   blob: Blob | null;
+  /** MIME from the metadata frame or magic-byte sniffing, when known. */
+  mime: string | null;
 }
 
 export type ListenerStatus =
@@ -85,6 +94,7 @@ function addTransfer(
     downloadUrl: null,
     retry: null,
     blob: null,
+    mime: null,
     ...fields,
   });
   store.transfers.unshift(transfer);
@@ -156,9 +166,10 @@ export async function startListener(sinkHash: boolean): Promise<void> {
       fullAddress: true,
       key,
       authorize: (destination) =>
-        destination.kind === "server_port" && destination.port === 1
+        destination.kind === "server_port" &&
+        (destination.port === 1 || destination.port === FILE_META_PORT)
           ? true
-          : "the browser transfer listener only accepts server port 1",
+          : "the browser transfer listener only accepts server ports 1 and 2",
       onConnection: (connection) => handleIncoming(connection, sinkHash),
       onError: (error) => {
         recordError(error);
@@ -229,6 +240,7 @@ export function enqueueSend(
   name: string | null,
   kind: "file" | "text",
   size: number,
+  mime: string | null,
   reader: (offset: number, length: number) => Promise<Uint8Array>,
 ): Promise<void> {
   // Capture the token now: the queued payload must go to the receiver chosen
@@ -236,7 +248,7 @@ export function enqueueSend(
   const token = normalizeToken(pendingSend.token);
   // Serialize sends: one connection at a time keeps status readable and
   // avoids competing relay sessions.
-  const run = sendQueue.then(() => sendPayload(token, name, kind, size, reader));
+  const run = sendQueue.then(() => sendPayload(token, name, kind, size, mime, reader));
   sendQueue = run.catch(() => undefined);
   return run;
 }
@@ -246,9 +258,11 @@ async function sendPayload(
   name: string | null,
   kind: "file" | "text",
   size: number,
+  mime: string | null,
   reader: (offset: number, length: number) => Promise<Uint8Array>,
 ): Promise<void> {
   const transfer = addTransfer({ direction: "send", kind, name, size });
+  transfer.mime = mime;
   if (token.length === 0) {
     transfer.status = "failed";
     transfer.error = recordError(new Error("Paste the receiver's token or link first"));
@@ -268,6 +282,7 @@ async function sendPayload(
 
 async function openStreamWithRetry(
   connection: EtcatBrowserConnection,
+  port: number,
 ): Promise<EasyTierTcpStream> {
   // Route sync over the relay can outlive a single 5 s connect attempt; retry
   // transient connect failures until the overall budget is exhausted.
@@ -280,7 +295,7 @@ async function openStreamWithRetry(
     try {
       return await openEtcatStream(
         connection,
-        { kind: "server_port", port: 1 },
+        { kind: "server_port", port },
         Math.min(STREAM_OPEN_ATTEMPT_MS, remaining),
       );
     } catch (error) {
@@ -291,6 +306,15 @@ async function openStreamWithRetry(
   }
 }
 
+function encodeFileFrameHeader(name: string, size: number, mime: string): Uint8Array {
+  const header = new TextEncoder().encode(JSON.stringify({ name, size, mime }));
+  const frame = new Uint8Array(FILE_FRAME_MAGIC.byteLength + 4 + header.byteLength);
+  frame.set(FILE_FRAME_MAGIC, 0);
+  new DataView(frame.buffer).setUint32(FILE_FRAME_MAGIC.byteLength, header.byteLength, true);
+  frame.set(header, FILE_FRAME_MAGIC.byteLength + 4);
+  return frame;
+}
+
 async function runSend(
   transfer: Transfer,
   token: string,
@@ -298,6 +322,9 @@ async function runSend(
   reader: (offset: number, length: number) => Promise<Uint8Array>,
 ): Promise<void> {
   const { connected, onEvent } = waitForRelayEvent();
+  // Files travel on port 2 with a metadata frame; text stays raw on port 1.
+  const isFile = transfer.kind === "file" && transfer.name !== null;
+  const port = isFile ? FILE_META_PORT : 1;
   let connection;
   let stream: EasyTierTcpStream | undefined;
   try {
@@ -311,9 +338,17 @@ async function runSend(
       RELAY_CONNECT_TIMEOUT_MS,
       "Timed out connecting to the relay; browsers need a reachable ws:// or wss:// EasyTier relay",
     );
-    stream = await openStreamWithRetry(connection);
+    stream = await openStreamWithRetry(connection, port);
     transfer.status = "transferring";
     transfer.startedAt = Date.now();
+    if (isFile) {
+      const frameHeader = encodeFileFrameHeader(
+        transfer.name!,
+        size,
+        transfer.mime ?? "application/octet-stream",
+      );
+      await writeAllStream(stream, frameHeader);
+    }
     const sent = await transferPayload(stream, size, reader, (bytes) => {
       transfer.bytes = bytes;
       testState.sentBytes = bytes;
@@ -332,6 +367,20 @@ async function runSend(
   }
 }
 
+async function writeAllStream(
+  stream: Pick<EasyTierTcpStream, "write">,
+  data: Uint8Array,
+): Promise<void> {
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = await stream.write(data.subarray(offset));
+    if (!Number.isInteger(written) || written <= 0 || written > data.byteLength - offset) {
+      throw new Error(`Invalid TCP write length ${written}`);
+    }
+    offset += written;
+  }
+}
+
 /** Token for the next send, set by the send panel. */
 export const pendingSend = reactive({ token: "" });
 
@@ -340,6 +389,96 @@ export const pendingSend = reactive({ token: "" });
 const MAX_BUFFERED_RECEIVE_BYTES = 512 * 1024 * 1024;
 // Only decode payloads up to this size when sniffing for text.
 const MAX_TEXT_SNIFF_BYTES = 16 * 1024 * 1024;
+
+interface FileFrameMeta {
+  name: string;
+  size?: number;
+  mime?: string;
+}
+
+/**
+ * Reads the leading bytes of a stream and, when the file-frame magic is
+ * present, parses the metadata header. Returns the metadata plus any payload
+ * bytes already read past the header. Raw streams come back with no meta and
+ * the peeked bytes as `head`.
+ */
+async function readFrameHead(
+  stream: Pick<EasyTierTcpStream, "read">,
+): Promise<{ meta: FileFrameMeta | null; head: Uint8Array[]; headBytes: number }> {
+  const MAGIC_LEN = 8;
+  const collected: Uint8Array[] = [];
+  let collectedBytes = 0;
+  let hitEof = false;
+  const pull = async (need: number): Promise<void> => {
+    while (collectedBytes < need && !hitEof) {
+      const result = await stream.read(65536);
+      if (result.data.byteLength === 0 && result.eof) {
+        hitEof = true;
+        break;
+      }
+      collected.push(result.data);
+      collectedBytes += result.data.byteLength;
+    }
+  };
+
+  await pull(MAGIC_LEN);
+  if (collectedBytes < MAGIC_LEN) {
+    // Stream too short to carry a frame header: treat as raw payload.
+    return { meta: null, head: collected, headBytes: collectedBytes };
+  }
+  const magic = joinHead(collected, MAGIC_LEN);
+  if (!magic.every((byte, index) => byte === FILE_FRAME_MAGIC[index])) {
+    return { meta: null, head: collected, headBytes: collectedBytes };
+  }
+
+  await pull(MAGIC_LEN + 4);
+  if (collectedBytes < MAGIC_LEN + 4) {
+    throw new Error("stream ended inside the file frame header");
+  }
+  const headerLen = new DataView(
+    joinHead(collected, MAGIC_LEN + 4).buffer,
+  ).getUint32(MAGIC_LEN, true);
+  if (headerLen > 64 * 1024) {
+    throw new Error("file metadata header too large");
+  }
+
+  await pull(MAGIC_LEN + 4 + headerLen);
+  if (collectedBytes < MAGIC_LEN + 4 + headerLen) {
+    throw new Error("stream ended inside the file frame header");
+  }
+  const headAll = joinHead(collected, collectedBytes);
+  const meta = JSON.parse(
+    new TextDecoder().decode(headAll.subarray(MAGIC_LEN + 4, MAGIC_LEN + 4 + headerLen)),
+  ) as FileFrameMeta;
+  if (typeof meta.name !== "string" || meta.name.length === 0) {
+    throw new Error("file metadata is missing a name");
+  }
+  // Sanitize: basename only, strip control characters, bound the length.
+  meta.name = meta.name
+    .split(/[\\/]/)
+    .pop()!
+    .replaceAll(/[\x00-\x1f\x7f]/g, "")
+    .slice(0, 255);
+
+  const payloadStart = MAGIC_LEN + 4 + headerLen;
+  return {
+    meta,
+    head: [headAll.subarray(payloadStart)],
+    headBytes: headAll.byteLength - payloadStart,
+  };
+}
+
+function joinHead(chunks: Uint8Array[], length: number): Uint8Array {
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    const slice = chunk.subarray(0, Math.min(chunk.byteLength, length - offset));
+    out.set(slice, offset);
+    offset += slice.byteLength;
+    if (offset >= length) break;
+  }
+  return out;
+}
 
 function handleIncoming(
   connection: EtcatBrowserIncomingConnection,
@@ -373,21 +512,32 @@ function handleIncoming(
     })();
   }
 
-  const transfer = addTransfer({
-    direction: "receive",
-    kind: "stream",
-    name: null,
-    size: null,
-  });
-  transfer.status = "transferring";
-  transfer.startedAt = Date.now();
-
   // The server closes the stream as soon as the returned promise settles, so
   // resolve only after the payload is fully buffered and presented.
   return (async () => {
+    const transfer = addTransfer({
+      direction: "receive",
+      kind: "stream",
+      name: null,
+      size: null,
+    });
+    transfer.status = "transferring";
+    transfer.startedAt = Date.now();
+
     const chunks: Uint8Array[] = [];
     let overflow = false;
     try {
+      const { meta, head, headBytes } = await readFrameHead(stream);
+      if (meta !== null) {
+        transfer.kind = "file";
+        transfer.name = meta.name;
+        transfer.mime = meta.mime ?? null;
+        if (typeof meta.size === "number") transfer.size = meta.size;
+      }
+      for (const chunk of head) {
+        if (chunk.byteLength > 0) chunks.push(Uint8Array.from(chunk));
+      }
+      transfer.bytes = headBytes;
       const total = await drainPayload(
         stream,
         (chunk) => {
@@ -398,11 +548,11 @@ function handleIncoming(
           chunks.push(Uint8Array.from(chunk));
         },
         (bytes) => {
-          transfer.bytes = bytes;
+          transfer.bytes = headBytes + bytes;
         },
       );
-      transfer.bytes = total;
-      presentReceivedPayload(transfer, chunks, total);
+      transfer.bytes = headBytes + total;
+      presentReceivedPayload(transfer, chunks, headBytes + total);
       transfer.status = "done";
     } catch (error) {
       transfer.status = "failed";
@@ -415,15 +565,43 @@ function handleIncoming(
   })();
 }
 
+/** Magic-byte MIME sniffing for payloads that arrive without a header. */
+function sniffMime(head: Uint8Array): string | null {
+  if (head.byteLength < 4) return null;
+  const b = head;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "image/gif";
+  if (
+    b.byteLength >= 12 &&
+    b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+    b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50
+  ) return "image/webp";
+  if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return "application/pdf";
+  if (
+    b.byteLength >= 8 &&
+    b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70
+  ) return "video/mp4";
+  if (
+    (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) ||
+    (b[0] === 0xff && (b[1] === 0xfb || b[1] === 0xf3 || b[1] === 0xf2))
+  ) return "audio/mpeg";
+  return null;
+}
+
 function presentReceivedPayload(
   transfer: Transfer,
   chunks: Uint8Array[],
   total: number,
 ): void {
-  // Text sniffing: cheap NUL/control-byte sample first, then a strict UTF-8
-  // decode. Binary payloads become a downloadable blob instead.
-  if (total <= MAX_TEXT_SNIFF_BYTES) {
-    const sample = chunks[0]?.subarray(0, 8192) ?? new Uint8Array();
+  // Text sniffing runs only when the header did not identify a file.
+  const head = chunks[0] ?? new Uint8Array();
+  const sniffedMime = transfer.mime ?? sniffMime(head);
+
+  const headerIdentifiedFile = transfer.kind === "file" && transfer.name !== null;
+  if (!headerIdentifiedFile && sniffedMime === null && total <= MAX_TEXT_SNIFF_BYTES) {
+    // Cheap NUL/control-byte sample first, then a strict UTF-8 decode.
+    const sample = head.subarray(0, 8192);
     let looksBinary = false;
     for (const byte of sample) {
       if (byte === 0) {
@@ -441,6 +619,7 @@ function presentReceivedPayload(
       try {
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         transfer.kind = "text";
+        transfer.mime = "text/plain;charset=utf-8";
         transfer.receivedText = text;
         return;
       } catch {
@@ -449,7 +628,10 @@ function presentReceivedPayload(
     }
   }
   transfer.kind = "file";
-  transfer.blob = new Blob(chunks as unknown as BlobPart[]);
+  transfer.mime = sniffedMime ?? transfer.mime;
+  transfer.blob = new Blob(chunks as unknown as BlobPart[], {
+    type: transfer.mime ?? "application/octet-stream",
+  });
   transfer.downloadUrl = URL.createObjectURL(transfer.blob);
 }
 

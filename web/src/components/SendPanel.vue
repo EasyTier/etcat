@@ -86,7 +86,7 @@ async function send(): Promise<void> {
     if (file.value !== null) {
       const payload = file.value;
       file.value = null;
-      await enqueueSend(payload.name, "file", payload.size, async (offset, length) => {
+      await enqueueSend(payload.name, "file", payload.size, payload.type || "application/octet-stream", async (offset, length) => {
         return new Uint8Array(
           await payload.slice(offset, offset + length).arrayBuffer(),
         );
@@ -94,7 +94,7 @@ async function send(): Promise<void> {
     } else {
       const data = new TextEncoder().encode(text.value);
       text.value = "";
-      await enqueueSend(null, "text", data.byteLength, async (offset, length) => {
+      await enqueueSend(null, "text", data.byteLength, "text/plain;charset=utf-8", async (offset, length) => {
         return data.subarray(offset, offset + length);
       });
     }

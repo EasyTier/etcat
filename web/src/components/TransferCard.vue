@@ -22,6 +22,19 @@ const { t } = useI18n();
 
 // Tick once per second so speed readouts stay fresh during a transfer.
 const now = ref(Date.now());
+
+const previewKind = computed<"image" | "video" | "audio" | "pdf" | null>(() => {
+  const mime = props.transfer.mime;
+  if (mime === null) return null;
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime === "application/pdf") return "pdf";
+  return null;
+});
+
+const previewUrl = computed(() => props.transfer.downloadUrl);
+const previewOpen = ref(false);
 const ticker = setInterval(() => {
   now.value = Date.now();
 }, 1000);
@@ -51,9 +64,8 @@ const title = computed(() => {
       ? t("transfer.sendTextTitle")
       : props.transfer.name ?? t("transfer.sendTitle");
   }
-  return props.transfer.kind === "text"
-    ? t("transfer.recvTextTitle")
-    : t("transfer.recvFileTitle");
+  if (props.transfer.kind === "text") return t("transfer.recvTextTitle");
+  return props.transfer.name ?? t("transfer.recvFileTitle");
 });
 
 const statusLabel = computed(() => {
@@ -173,6 +185,39 @@ async function save(): Promise<void> {
       </button>
     </div>
 
+    <!-- Inline previews for received files -->
+    <div
+      v-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done' && previewKind === 'image' && previewUrl !== null"
+      class="mt-4"
+    >
+      <img
+        :src="previewUrl"
+        :alt="transfer.name ?? 'preview'"
+        class="max-h-72 cursor-zoom-in rounded-xl border border-edge object-contain"
+        @click="previewOpen = true"
+      />
+    </div>
+    <div
+      v-else-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done' && previewKind === 'video' && previewUrl !== null"
+      class="mt-4"
+    >
+      <video :src="previewUrl" controls class="max-h-72 rounded-xl border border-edge" />
+    </div>
+    <div
+      v-else-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done' && previewKind === 'audio' && previewUrl !== null"
+      class="mt-4"
+    >
+      <audio :src="previewUrl" controls class="w-full" />
+    </div>
+    <div
+      v-else-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done' && previewKind === 'pdf' && previewUrl !== null"
+      class="mt-4"
+    >
+      <button type="button" class="btn-ghost" @click="previewOpen = true">
+        {{ t("transfer.previewPdf") }}
+      </button>
+    </div>
+
     <div
       v-if="transfer.direction === 'receive' && transfer.kind === 'file' && transfer.status === 'done'"
       class="mt-4"
@@ -187,5 +232,28 @@ async function save(): Promise<void> {
         {{ saving ? t("transfer.saving") : `${t("transfer.saveFile")} (${formatBytes(transfer.bytes)})` }}
       </button>
     </div>
+
+    <!-- Full-screen image / PDF preview -->
+    <Teleport to="body">
+      <div
+        v-if="previewOpen && previewUrl !== null"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm"
+        @click="previewOpen = false"
+      >
+        <img
+          v-if="previewKind === 'image'"
+          :src="previewUrl"
+          :alt="transfer.name ?? 'preview'"
+          class="max-h-full max-w-full rounded-xl object-contain"
+          @click.stop
+        />
+        <iframe
+          v-else-if="previewKind === 'pdf'"
+          :src="previewUrl"
+          class="h-full w-full rounded-xl border border-edge bg-white"
+          @click.stop
+        />
+      </div>
+    </Teleport>
   </div>
 </template>

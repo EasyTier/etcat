@@ -24,6 +24,7 @@ const messages = {
     "timeline.justNow": "just now",
     "timeline.minutesAgo": "m ago",
     "timeline.hoursAgo": "h ago",
+    "transfer.previewPdf": "Preview PDF",
     "tab.receive": "Receive",
     "tab.send": "Send",
 
@@ -107,6 +108,7 @@ const messages = {
     "timeline.earlier": "更早",
     "timeline.justNow": "刚刚",
     "timeline.minutesAgo": " 分钟前",
+    "transfer.previewPdf": "预览 PDF",
     "timeline.hoursAgo": " 小时前",
     "conn.incoming": "传入",
     "conn.outgoing": "传出",
