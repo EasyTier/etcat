@@ -428,6 +428,14 @@ async function readFrameHead(
   }
   const magic = joinHead(collected, MAGIC_LEN);
   if (!magic.every((byte, index) => byte === FILE_FRAME_MAGIC[index])) {
+    // A recognized frame-family prefix with an unknown version is a hard
+    // error; anything else is a raw stream.
+    const FAMILY = FILE_FRAME_MAGIC.subarray(0, 6);
+    if (FAMILY.every((byte, index) => magic[index] === byte)) {
+      throw new Error(
+        `unsupported file frame version: expected ${new TextDecoder().decode(FILE_FRAME_MAGIC)}, got ${new TextDecoder().decode(magic)}`,
+      );
+    }
     return { meta: null, head: collected, headBytes: collectedBytes };
   }
 
@@ -459,6 +467,12 @@ async function readFrameHead(
     .pop()!
     .replaceAll(/[\x00-\x1f\x7f]/g, "")
     .slice(0, 255);
+  if (meta.name.length === 0) {
+    throw new Error("file metadata name is empty after sanitization");
+  }
+  if (meta.mime !== undefined && typeof meta.mime !== "string") {
+    meta.mime = undefined;
+  }
 
   const payloadStart = MAGIC_LEN + 4 + headerLen;
   return {
@@ -524,20 +538,29 @@ function handleIncoming(
     transfer.status = "transferring";
     transfer.startedAt = Date.now();
 
+    // Only port 2 carries frames; port 1 stays raw forever.
+    const isFramePort =
+      connection.destination.kind === "server_port" &&
+      connection.destination.port === FILE_META_PORT;
+
     const chunks: Uint8Array[] = [];
     let overflow = false;
     try {
-      const { meta, head, headBytes } = await readFrameHead(stream);
-      if (meta !== null) {
-        transfer.kind = "file";
-        transfer.name = meta.name;
-        transfer.mime = meta.mime ?? null;
-        if (typeof meta.size === "number") transfer.size = meta.size;
+      let headBytes = 0;
+      if (isFramePort) {
+        const head = await readFrameHead(stream);
+        headBytes = head.headBytes;
+        if (head.meta !== null) {
+          transfer.kind = "file";
+          transfer.name = head.meta.name;
+          transfer.mime = head.meta.mime ?? null;
+          if (typeof head.meta.size === "number") transfer.size = head.meta.size;
+        }
+        for (const chunk of head.head) {
+          if (chunk.byteLength > 0) chunks.push(Uint8Array.from(chunk));
+        }
+        transfer.bytes = headBytes;
       }
-      for (const chunk of head) {
-        if (chunk.byteLength > 0) chunks.push(Uint8Array.from(chunk));
-      }
-      transfer.bytes = headBytes;
       const total = await drainPayload(
         stream,
         (chunk) => {
@@ -595,7 +618,7 @@ function presentReceivedPayload(
   total: number,
 ): void {
   // Text sniffing runs only when the header did not identify a file.
-  const head = chunks[0] ?? new Uint8Array();
+  const head = joinHead(chunks, Math.min(16, chunks.reduce((sum, c) => sum + c.byteLength, 0)));
   const sniffedMime = transfer.mime ?? sniffMime(head);
 
   const headerIdentifiedFile = transfer.kind === "file" && transfer.name !== null;

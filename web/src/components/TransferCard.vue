@@ -110,7 +110,7 @@ const saving = ref(false);
 async function save(): Promise<void> {
   saving.value = true;
   try {
-    await saveReceivedFile(props.transfer.id, "etcat-download");
+    await saveReceivedFile(props.transfer.id, props.transfer.name ?? "etcat-download");
   } catch (error) {
     // Keep the payload, but surface the failure on the card.
     props.transfer.error =

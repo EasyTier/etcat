@@ -18,9 +18,8 @@ const title = computed(() => {
       ? t("transfer.sendTextTitle")
       : props.transfer.name ?? t("transfer.sendTitle");
   }
-  return props.transfer.kind === "text"
-    ? t("transfer.recvTextTitle")
-    : t("transfer.recvFileTitle");
+  if (props.transfer.kind === "text") return t("transfer.recvTextTitle");
+  return props.transfer.name ?? t("transfer.recvFileTitle");
 });
 
 const ago = computed(() => {

@@ -783,11 +783,28 @@ const FILE_FRAME_MAGIC: &[u8; 8] = b"ETCATF01";
 async fn receive_named_file(stream: &mut TcpStream) -> Result<()> {
     const MAX_HEADER_LEN: usize = 64 * 1024;
 
+    // Read up to 8 magic bytes; short raw streams keep their bytes and are
+    // replayed to stdout rather than erroring out.
     let mut magic = [0u8; 8];
-    stream.read_exact(&mut magic).await?;
+    let mut magic_len = 0;
+    while magic_len < 8 {
+        let read = stream.read(&mut magic[magic_len..]).await?;
+        if read == 0 {
+            let mut stdout = tokio::io::stdout();
+            stdout.write_all(&magic[..magic_len]).await?;
+            copy(stream, &mut stdout).await?;
+            return Ok(());
+        }
+        magic_len += read;
+    }
     if &magic != FILE_FRAME_MAGIC {
-        // No metadata frame: the magic bytes are payload. Replay them and
-        // continue as a raw stream.
+        // A recognized frame-family prefix with an unknown version is a hard
+        // error; anything else is a raw stream whose bytes are replayed.
+        anyhow::ensure!(
+            !magic.starts_with(b"ETCATF"),
+            "unsupported file frame version: expected ETCATF01, got {}",
+            String::from_utf8_lossy(&magic)
+        );
         let mut stdout = tokio::io::stdout();
         stdout.write_all(&magic).await?;
         copy(stream, &mut stdout).await?;
@@ -804,15 +821,24 @@ async fn receive_named_file(stream: &mut TcpStream) -> Result<()> {
         .get("name")
         .and_then(serde_json::Value::as_str)
         .context("file metadata is missing a name")?;
-    let name = Path::new(name)
-        .file_name()
-        .context("file metadata name is not a file name")?
-        .to_string_lossy()
-        .into_owned();
+    // Basename on both slash styles, then strip control characters (terminal
+    // escapes included), then revalidate.
+    let name: String = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     anyhow::ensure!(!name.is_empty() && name.len() <= 255, "invalid file name");
     let path = std::env::current_dir()?.join(&name);
-    anyhow::ensure!(!path.exists(), "{name} already exists in the working directory");
-    let mut file = tokio::fs::File::create(&path).await?;
+    // create_new is atomic: it refuses existing files and final symlinks.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("{name} already exists in the working directory"))?;
     let written = copy(stream, &mut file).await?;
     eprintln!("# Received {written} bytes -> {}", path.display());
     Ok(())
